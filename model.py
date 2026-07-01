@@ -21,8 +21,8 @@ class DenseCountEmbeddingBag(nn.Module):
         return torch.matmul(counts, self.weight)
 
 class ChemPFN(pl.LightningModule):
-    def __init__(self, d_desc, d_fp=2048, d_model=256, n_heads=4, n_layers=10, lr=1e-4,
-                 hidden_dim=256, max_classes=10):
+    def __init__(self, d_desc, d_fp=2048, d_model=384, n_heads=4, n_layers=12, lr=1e-4,
+                 hidden_dim=256, max_classes=2):
         super().__init__()
         self.save_hyperparameters()
 

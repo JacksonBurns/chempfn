@@ -1,6 +1,6 @@
 import torch
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import EarlyStopping
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
 from torch.utils.data import Dataset, DataLoader
 from model import ChemPFN
@@ -17,7 +17,7 @@ class PFNSyntheticDataset(Dataset):
     def __getitem__(self, idx):
         return idx  
 
-def make_collate_fn(X_full, min_n=16, max_n=1_024):
+def make_collate_fn(X_full, min_n=64, max_n=1_024):
     def collate_fn(batch):
         B = len(batch)
         n_samples = torch.randint(min_n, max_n + 1, (1,)).item()
@@ -47,13 +47,13 @@ def run_training(smiles_list, max_epochs=512):
     dataset = PFNSyntheticDataset(X_normalized)
     dataloader = DataLoader(
         dataset,
-        batch_size=32,
+        batch_size=16,
         num_workers=2,
         shuffle=True,
         collate_fn=make_collate_fn(X_normalized),
     )
 
-    model = ChemPFN(d_desc=d_desc, d_fp=d_fp, max_classes=2, lr=1e-5)
+    model = ChemPFN(d_desc=d_desc, d_fp=d_fp)
     model.X_mean = X_mean
     model.X_std = X_std
     
@@ -64,13 +64,20 @@ def run_training(smiles_list, max_epochs=512):
         patience=10,
         mode="min"
     )
+    model_checkpoint_callback = ModelCheckpoint(
+        monitor="train_loss_epoch",
+        dirpath=logger.log_dir,
+        filename="best_model",
+        save_top_k=1,
+        mode="min"
+    )
     
     trainer = pl.Trainer(
         max_epochs=max_epochs,
         accelerator="auto", 
         devices="auto",
         logger=logger,
-        callbacks=[early_stop_callback],
+        callbacks=[early_stop_callback, model_checkpoint_callback],
     )
     
     trainer.fit(model, dataloader)
@@ -78,7 +85,7 @@ def run_training(smiles_list, max_epochs=512):
 
 if __name__ == "__main__":
     torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
-
+    torch.set_float32_matmul_precision('medium')
     pl.seed_everything(42)
     with open("cleaned_pubchem_1MM.smiles", "r") as file:
         smiles = [line.strip() for line in file.readlines()]
