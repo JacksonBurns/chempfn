@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import lightning.pytorch as pl
 import math
 from features import get_rdkit_features
+from optim import SAM
 
 class DenseCountEmbeddingBag(nn.Module):
     """
@@ -20,10 +21,13 @@ class DenseCountEmbeddingBag(nn.Module):
         return torch.matmul(counts, self.weight)
 
 class ChemPFN(pl.LightningModule):
-    def __init__(self, d_desc, d_fp=2048, d_model=512, n_heads=8, n_layers=8, lr=1e-4,
-                 hidden_dim=128, max_classes=10):
+    def __init__(self, d_desc, d_fp=2048, d_model=256, n_heads=4, n_layers=10, lr=1e-4,
+                 hidden_dim=256, max_classes=10):
         super().__init__()
         self.save_hyperparameters()
+
+        # REQUIRED FOR SAM: Turn off Lightning's automatic step calls
+        self.automatic_optimization = False
 
         # We track mean/std for the combined feature vector so predict_step can remain untouched
         self.register_buffer("X_mean", torch.zeros(d_desc + d_fp))
@@ -116,35 +120,85 @@ class ChemPFN(pl.LightningModule):
         
         if task == "regression":
             targets = (raw - raw.mean(1, keepdim=True)) / (raw.std(1, keepdim=True) + 1e-6)
+            
+            # --- CHEMINFORMATICS REALITY: Zero-Inflated / Clipped Assays ---
+            # 50% chance to simulate a lower limit of detection (LOD)
+            if torch.rand(1).item() > 0.5:
+                q_floor = torch.rand(1, device=device).item() * 0.25 # Clip bottom 0-25%
+                floor_val = torch.quantile(targets, q_floor, dim=1, keepdim=True)
+                targets = torch.max(targets, floor_val)
+            
+            # 25% chance to also simulate an upper assay saturation point
+            if torch.rand(1).item() > 0.75:
+                q_ceil = 1.0 - (torch.rand(1, device=device).item() * 0.25)
+                ceil_val = torch.quantile(targets, q_ceil, dim=1, keepdim=True)
+                targets = torch.min(targets, ceil_val)
+                
             return targets  
             
         n_classes = torch.randint(2, self.hparams.max_classes + 1, (1,)).item()
-        qs = torch.linspace(0, 1, n_classes + 1, device=device)[1:-1]
+        
+        # --- CHEMINFORMATICS REALITY: Extreme Class Imbalance ---
+        if n_classes == 2:
+            # Random active class ratio between 1% and 50%
+            pos_ratio = torch.empty(1, device=device).uniform_(0.01, 0.5).item()
+            qs = torch.tensor([1.0 - pos_ratio], device=device)
+        else:
+            # For multi-class, randomly skew bucket sizes instead of linspace
+            qs = torch.rand(n_classes - 1, device=device).sort()[0]
+
         edges = torch.quantile(raw.squeeze(-1), qs, dim=1).transpose(0, 1)  
         labels = torch.zeros(B, N, dtype=torch.long, device=device)
         for c in range(n_classes - 1):
             labels += (raw.squeeze(-1) > edges[:, c:c + 1]).long()
-        return labels, n_classes  
+            
+        return labels, n_classes
 
     def training_step(self, batch, batch_idx):
         x_batch = batch
         B, N, _ = x_batch.shape
-        task = "classification" if torch.rand(1).item() > 0.5 else "regression"
         query_mask = torch.rand(B, N, 1, device=self.device) > 0.5
 
-        if task == "regression":
-            y_batch = self.generate_synthetic_prior(x_batch, task="regression")
-            preds = self(x_batch, y_batch, query_mask, task="regression")
-            loss = F.mse_loss(preds[query_mask], y_batch[query_mask])
-        else:
-            y_batch, n_classes = self.generate_synthetic_prior(x_batch, task="classification")
-            qmask2d = query_mask.squeeze(-1)
-            preds = self(x_batch, y_batch, query_mask, task="classification")
-            loss = F.cross_entropy(preds[..., :n_classes][qmask2d], y_batch[qmask2d])
+        # 1. Generate BOTH synthetic datasets for this batch of X
+        y_reg = self.generate_synthetic_prior(x_batch, task="regression")
+        y_cls, n_classes = self.generate_synthetic_prior(x_batch, task="classification")
+        qmask2d = query_mask.squeeze(-1)
 
-        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        self.log(f"train_loss_{task}", loss, on_step=True, on_epoch=True)
-        return loss
+        opt = self.optimizers()
+
+        # 2. Define a joint loss computation
+        def compute_loss():
+            # Forward pass 1: Regression
+            preds_reg = self(x_batch, y_reg, query_mask, task="regression")
+            loss_reg = F.mse_loss(preds_reg[query_mask], y_reg[query_mask])
+            
+            # Forward pass 2: Classification
+            preds_cls = self(x_batch, y_cls, query_mask, task="classification")
+            loss_cls = F.cross_entropy(preds_cls[..., :n_classes][qmask2d], y_cls[qmask2d])
+            
+            # Sum the losses so gradients flow to all heads and projection layers
+            total_loss = loss_reg + loss_cls
+            return total_loss, loss_reg, loss_cls
+
+        # --- SAM Pass 1: Climb to the sharpest point in the joint neighborhood ---
+        total_loss, loss_reg, loss_cls = compute_loss()
+        self.manual_backward(total_loss)
+        opt.first_step(zero_grad=True)
+
+        # --- SAM Pass 2: Calculate gradients at the sharp point to update weights ---
+        total_loss_2, _, _ = compute_loss()
+        self.manual_backward(total_loss_2)
+        opt.second_step(zero_grad=True)
+
+        # 3. Comprehensive Logging
+        self.log("train_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_loss_regression", loss_reg, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_loss_classification", loss_cls, on_step=True, on_epoch=True, sync_dist=True)
+        
+        # Log the sharpness penalty (how much worse the joint loss gets after the SAM step)
+        self.log("train_loss_sam_penalty", total_loss_2 - total_loss, on_step=True, on_epoch=True, sync_dist=True)
+
+        return total_loss.detach()
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0, task="regression",
                   n_classes=None, max_context=512, n_ensemble=4):
@@ -208,6 +262,9 @@ class ChemPFN(pl.LightningModule):
             return preds_sum * y_std + y_mean
             
         return preds_sum 
-
+    
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
+        # Wrap AdamW inside our SAM optimizer
+        base_opt = torch.optim.AdamW
+        # rho=0.05 is the standard SAM neighborhood size
+        return SAM(self.parameters(), base_opt, lr=self.hparams.lr, rho=0.05)

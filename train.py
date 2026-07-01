@@ -17,7 +17,7 @@ class PFNSyntheticDataset(Dataset):
     def __getitem__(self, idx):
         return idx  
 
-def make_collate_fn(X_full, min_n=16, max_n=512):
+def make_collate_fn(X_full, min_n=16, max_n=1_024):
     def collate_fn(batch):
         B = len(batch)
         n_samples = torch.randint(min_n, max_n + 1, (1,)).item()
@@ -47,13 +47,13 @@ def run_training(smiles_list, max_epochs=512):
     dataset = PFNSyntheticDataset(X_normalized)
     dataloader = DataLoader(
         dataset,
-        batch_size=64,
-        num_workers=0,
+        batch_size=32,
+        num_workers=2,
         shuffle=True,
         collate_fn=make_collate_fn(X_normalized),
     )
 
-    model = ChemPFN(d_desc=d_desc, d_fp=d_fp, max_classes=2)
+    model = ChemPFN(d_desc=d_desc, d_fp=d_fp, max_classes=2, lr=1e-5)
     model.X_mean = X_mean
     model.X_std = X_std
     
@@ -71,13 +71,14 @@ def run_training(smiles_list, max_epochs=512):
         devices="auto",
         logger=logger,
         callbacks=[early_stop_callback],
-        gradient_clip_val=0.5,
     )
     
     trainer.fit(model, dataloader)
     print(f"Training complete. Logs available in: {logger.log_dir}")
 
 if __name__ == "__main__":
+    torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+
     pl.seed_everything(42)
     with open("cleaned_pubchem_1MM.smiles", "r") as file:
         smiles = [line.strip() for line in file.readlines()]
