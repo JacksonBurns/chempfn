@@ -46,7 +46,35 @@ class ChemPFN(pl.LightningModule):
         tokens = x_tok + y_tok + task_tok
         out = self.transformer(tokens)
         return self.head_reg(out) if task == "regression" else self.head_cls(out)
-        
+
+    def _random_mlp_layer(self, h, in_dim, H, act, device):
+        """One layer of a random MLP, vectorized over the batch (independent
+        random weights per batch element)."""
+        B = h.shape[0]
+        W = torch.randn(B, in_dim, H, device=device) / math.sqrt(in_dim)
+        b = torch.randn(B, 1, H, device=device) * 0.1
+        return act(torch.bmm(h, W) + b)
+
+    def _random_tree_layer(self, h, H, device, depth=3, n_trees=4):
+        """One layer of a random oblivious tree ensemble (CatBoost-style
+        symmetric trees), vectorized over the batch. Each tree in the
+        ensemble splits on `depth` randomly chosen input features with
+        random thresholds, shared across all rows within a batch element,
+        and emits a random H-dim value per leaf."""
+        B, N, in_dim = h.shape
+        n_leaves = 2 ** depth
+        out = torch.zeros(B, N, H, device=device)
+        powers = (2 ** torch.arange(depth, device=device)).view(1, 1, depth)
+        for _ in range(n_trees):
+            feat_idx = torch.randint(0, in_dim, (B, depth), device=device)
+            feat_vals = torch.gather(h, 2, feat_idx.unsqueeze(1).expand(B, N, depth))
+            thresholds = torch.randn(B, 1, depth, device=device) * 0.5
+            bits = (feat_vals > thresholds).long()
+            leaf_idx = (bits * powers).sum(-1)  # (B, N)
+            leaf_values = torch.randn(B, n_leaves, H, device=device) / math.sqrt(depth + 1)
+            out = out + torch.gather(leaf_values, 1, leaf_idx.unsqueeze(-1).expand(B, N, H))
+        return out / n_trees
+
     def generate_synthetic_prior(self, x, task):
         B, N, D = x.shape
         H = self.hparams.hidden_dim
@@ -54,13 +82,17 @@ class ChemPFN(pl.LightningModule):
 
         depth = torch.randint(1, 4, (1,)).item()
         activations = [F.relu, torch.tanh, F.gelu]
-        act = activations[torch.randint(0, len(activations), (1,)).item()]
 
         h, in_dim = x, D
         for _ in range(depth):
-            W = torch.randn(B, in_dim, H, device=device) / math.sqrt(in_dim)
-            b = torch.randn(B, 1, H, device=device) * 0.1
-            h = act(torch.bmm(h, W) + b)
+            # Mix random-MLP and random-tree-ensemble transforms in the
+            # data-generating chain, following the SCM-with-tree-mixing
+            # priors used by TabForestPFN / TabICL.
+            if torch.rand(1).item() > 0.5:
+                act = activations[torch.randint(0, len(activations), (1,)).item()]
+                h = self._random_mlp_layer(h, in_dim, H, act, device)
+            else:
+                h = self._random_tree_layer(h, H, device)
             in_dim = H
         W_out = torch.randn(B, in_dim, 1, device=device) / math.sqrt(in_dim)
         raw = torch.bmm(h, W_out)
@@ -97,7 +129,7 @@ class ChemPFN(pl.LightningModule):
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
         self.log(f"train_loss_{task}", loss, on_step=True, on_epoch=True)
         return loss
-    
+
     def predict_step(self, batch, batch_idx, dataloader_idx=0, task="regression",
                   n_classes=None, max_context=512, n_ensemble=4):
         train_smiles, train_labels, test_smiles = batch

@@ -1,0 +1,9 @@
+polaris-lib
+tabulate
+lightning
+torch
+numpy
+scikit-learn
+rdkit
+tqdm
+tensorboard

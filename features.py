@@ -1,6 +1,6 @@
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import Descriptors
+from rdkit.Chem import Descriptors, rdFingerprintGenerator
 from rdkit.ML.Descriptors import MoleculeDescriptors
 from multiprocessing import Pool, cpu_count
 import contextlib
@@ -19,6 +19,10 @@ SQLITE_VAR_LIMIT = 900
 # How many rows to buffer before committing a write batch.
 WRITE_BATCH_SIZE = 5000
 
+# Morgan (ECFP-style) count fingerprint settings.
+MORGAN_RADIUS = 2
+MORGAN_N_BITS = 2048
+
 
 def silence_output(func):
     @wraps(func)
@@ -31,15 +35,21 @@ def silence_output(func):
 
 @silence_output
 def _process_single_molecule(smi):
-    """Helper function to calculate descriptors for a single molecule."""
+    """Helper function to calculate RDKit descriptors and Morgan count
+    fingerprints for a single molecule, concatenated into one feature vector."""
     # Re-initialize calculator inside each process to avoid pickling issues
     desc_names = [d[0] for d in Descriptors.descList]
     calc = MoleculeDescriptors.MolecularDescriptorCalculator(desc_names)
+    morgan_gen = rdFingerprintGenerator.GetMorganGenerator(radius=MORGAN_RADIUS, fpSize=MORGAN_N_BITS)
+    n_total = len(desc_names) + MORGAN_N_BITS
+
     mol = Chem.MolFromSmiles(smi)
     if mol:
-        return calc.CalcDescriptors(mol)
+        descriptors = np.asarray(calc.CalcDescriptors(mol), dtype=np.float32)
+        fingerprint = morgan_gen.GetCountFingerprintAsNumPy(mol).astype(np.float32)
+        return np.concatenate([descriptors, fingerprint])
     else:
-        return np.zeros(len(desc_names))
+        return np.zeros(n_total, dtype=np.float32)
 
 
 def _hash_smiles(smi):
@@ -103,10 +113,11 @@ def _write_cache(conn, rows):
 
 
 def get_rdkit_features(smiles_list, n_proc=None, db_path=CACHE_DB, use_cache=True):
-    """Parallelized utility to calculate descriptors, with SQLite-based caching."""
+    """Parallelized utility to calculate RDKit descriptors + Morgan count
+    fingerprints, with SQLite-based caching."""
     bl = BlockLogs()
     n = len(smiles_list)
-    n_desc = len(Descriptors.descList)
+    n_desc = len(Descriptors.descList) + MORGAN_N_BITS
     results = [None] * n
 
     conn = _get_connection(db_path) if use_cache else None
