@@ -15,21 +15,33 @@ class PFNSyntheticDataset(Dataset):
         return self.length
 
     def __getitem__(self, idx):
-        return idx  # dummy — actual sampling happens in collate_fn
+        return idx  
 
 def make_collate_fn(X_full, min_n=16, max_n=512):
     def collate_fn(batch):
         B = len(batch)
         n_samples = torch.randint(min_n, max_n + 1, (1,)).item()
         idx = torch.randint(0, len(X_full), (B, n_samples))
-        return X_full[idx]  # (B, n_samples, D), fully vectorized gather
+        return X_full[idx] 
     return collate_fn
-
 
 def run_training(smiles_list, max_epochs=512):
     X_raw = get_rdkit_features(smiles_list)
-    X_mean = torch.tensor(X_raw.mean(axis=0), dtype=torch.float32)
-    X_std = torch.tensor(X_raw.std(axis=0) + 1e-6, dtype=torch.float32)
+    
+    # RDKit Morgan count fingerprint features are exactly 2048 long based on features.py
+    d_fp = 2048
+    d_desc = X_raw.shape[1] - d_fp
+
+    X_mean = torch.zeros(X_raw.shape[1], dtype=torch.float32)
+    X_std = torch.ones(X_raw.shape[1], dtype=torch.float32)
+
+    # IMPORTANT: Only calculate mean/std for continuous descriptors.
+    # Normalizing count fingerprints ruins their integer properties.
+    X_mean[:d_desc] = torch.tensor(X_raw[:, :d_desc].mean(axis=0), dtype=torch.float32)
+    X_std[:d_desc] = torch.tensor(X_raw[:, :d_desc].std(axis=0) + 1e-6, dtype=torch.float32)
+
+    # The descriptor portion is normalized (mean 0, std 1)
+    # The fingerprint portion remains completely untouched
     X_normalized = (torch.tensor(X_raw) - X_mean) / X_std
 
     dataset = PFNSyntheticDataset(X_normalized)
@@ -41,22 +53,18 @@ def run_training(smiles_list, max_epochs=512):
         collate_fn=make_collate_fn(X_normalized),
     )
 
-    model = ChemPFN(d_in=X_normalized.shape[1], max_classes=2)
+    model = ChemPFN(d_desc=d_desc, d_fp=d_fp, max_classes=2)
     model.X_mean = X_mean
     model.X_std = X_std
     
-    # 1. Setup TensorBoard Logger
     logger = TensorBoardLogger(save_dir="logs/", name="chem_pfn_experiment", default_hp_metric=False)
-
-    # 2. Setup Early Stopping
-    # Monitors 'train_loss'
+    
     early_stop_callback = EarlyStopping(
         monitor="train_loss_epoch", 
         patience=10,
         mode="min"
     )
-
-    # 3. Update Trainer
+    
     trainer = pl.Trainer(
         max_epochs=max_epochs,
         accelerator="auto", 
