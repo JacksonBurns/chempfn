@@ -49,7 +49,7 @@ def run_training(smiles_list, max_epochs=512):
     dataset = SmilesDataset(smiles_list)
     dataloader = DataLoader(
         dataset,
-        batch_size=32,
+        batch_size=32,  # does nothing, is set by collate_fn
         num_workers=2,
         shuffle=True,
         collate_fn=make_collate_fn(smiles_list, desc_normalized),
