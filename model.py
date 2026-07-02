@@ -54,10 +54,8 @@ class ChemPFN(pl.LightningModule):
         if isinstance(x, BatchCuikMolGraph):
             n_mol = len(x.batch.unique())
             x_tok = self.aggregator(self.gnn(x), x.batch).view(1, n_mol, d_model)
-            device = x.V.device
         else:
             x_tok = x
-            device = x.device
 
         if task == "regression":
             y_tok = self.y_proj_reg(y)
@@ -86,8 +84,6 @@ class ChemPFN(pl.LightningModule):
         # Pick a random descriptor dimension
         d_idx = torch.randint(0, D, (1,)).item()
         y_single = y[:, :, d_idx:d_idx + 1]  # (1, N, 1)
-
-        opt = self.optimizers()
 
         if torch.rand(1).item() > 0.5:
             # --- REGRESSION ---
