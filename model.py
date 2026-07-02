@@ -121,34 +121,35 @@ class ChemPFN(pl.LightningModule):
         B, N, D = 1, y.shape[1], y.shape[2]
         query_mask = torch.rand(B, N, 1, device=self.device) > 0.5
 
-        # Randomly select a subset of descriptors (10-50% of available)
+        # Average over multiple random hyperdescriptors to reduce variance
+        n_accum = 4
+        H = 32
         K = torch.randint(max(5, D // 20), max(10, D // 2), (1,)).item()
         k_idx = torch.randperm(D, device=self.device)[:K]
         y_subset = y[:, :, k_idx]  # (1, N, K)
 
-        # Pass through random MLP → scalar hyperdescriptor
-        H = 32
-        y_hyper = _random_mlp_hyperdescriptor(y_subset, H, self.device)  # (1, N, 1)
-
         if torch.rand(1).item() > 0.5:
-            # --- REGRESSION ---
-            preds = self(graph, y_hyper, query_mask, task="regression")
-            q = query_mask.squeeze(-1)
-            loss = F.mse_loss(preds[q], y_hyper[q])
+            # --- REGRESSION (averaged) ---
+            loss = 0.0
+            for _ in range(n_accum):
+                y_hyper = _random_mlp_hyperdescriptor(y_subset, H, self.device)
+                preds = self(graph, y_hyper, query_mask, task="regression")
+                q = query_mask.squeeze(-1)
+                loss += F.mse_loss(preds[q], y_hyper[q])
+            loss /= n_accum
             self.log("train_loss_reg", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=N)
         else:
-            # --- BINARY CLASSIFICATION ---
-            # Threshold at batch median
-            q = query_mask.squeeze(-1)
-            context_vals = y_hyper[~q, 0]
-            if context_vals.numel() > 1:
-                median = context_vals.median()
-            else:
-                median = context_vals.mean()
-            y_cls = (y_hyper[:, :, 0] >= median).long()
-
-            preds = self(graph, y_cls, query_mask, task="classification")
-            loss = F.cross_entropy(preds[..., :2][q], y_cls[q])
+            # --- BINARY CLASSIFICATION (averaged) ---
+            loss = 0.0
+            for _ in range(n_accum):
+                y_hyper = _random_mlp_hyperdescriptor(y_subset, H, self.device)
+                q = query_mask.squeeze(-1)
+                context_vals = y_hyper[~q, 0]
+                median = context_vals.median() if context_vals.numel() > 1 else context_vals.mean()
+                y_cls = (y_hyper[:, :, 0] >= median).long()
+                preds = self(graph, y_cls, query_mask, task="classification")
+                loss += F.cross_entropy(preds[..., :2][q], y_cls[q])
+            loss /= n_accum
             self.log("train_loss_cls", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=N)
 
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=N)
