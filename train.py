@@ -45,7 +45,7 @@ def run_training(smiles_list, max_epochs=512):
     dataset = SmilesDataset(smiles_list)
     dataloader = DataLoader(
         dataset,
-        batch_size=32,  # does nothing, is set by collate_fn
+        batch_size=32,  # actually ends up being number of steps per epoch, since we sample a random number of molecules each time
         num_workers=2,
         shuffle=True,
         collate_fn=make_collate_fn(smiles_list, desc_tensor),
@@ -74,11 +74,10 @@ def run_training(smiles_list, max_epochs=512):
         max_epochs=max_epochs,
         accelerator="auto",
         devices="auto",
-        strategy=DDPStrategy(find_unused_parameters=True),
+        strategy=DDPStrategy(find_unused_parameters=True),  # regression and classification head are not always used in the same forward pass
         logger=logger,
         callbacks=[early_stop_callback, model_checkpoint_callback],
         default_root_dir=logger.log_dir,
-        strategy=DDPStrategy(find_unused_parameters=True),
     )
 
     trainer.fit(model, dataloader)
