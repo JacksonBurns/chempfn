@@ -40,7 +40,10 @@ def run_training(smiles_list, max_epochs=512):
     raw_desc = get_rdkit_descriptors(smiles_list)
     print(f"Descriptor shape: {raw_desc.shape}")
 
-    desc_tensor = torch.tensor(raw_desc, dtype=torch.float32)
+    raw_t = torch.tensor(raw_desc, dtype=torch.float32)
+    desc_mean = raw_t.mean(dim=0)
+    desc_std = raw_t.std(dim=0) + 1e-6
+    desc_tensor = (raw_t - desc_mean) / desc_std
 
     dataset = SmilesDataset(smiles_list)
     dataloader = DataLoader(
