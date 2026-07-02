@@ -32,15 +32,11 @@ class ChemPFN(pl.LightningModule):
         )
         self.aggregator = NormAggregation()
 
-        # Training: descriptor projection (217 → d_model)
-        self.y_proj_desc = nn.Linear(N_DESC, d_model)
-        self.head_desc = nn.Linear(d_model, N_DESC)
-
-        # Inference: regression
+        # Regression: single scalar label projection + head
         self.y_proj_reg = nn.Linear(1, d_model)
         self.head_reg = nn.Linear(d_model, 1)
 
-        # Inference: classification
+        # Classification: class embedding + head
         self.y_embed_cls = nn.Embedding(max_classes, d_model)
         self.head_cls = nn.Linear(d_model, max_classes)
 
@@ -52,11 +48,7 @@ class ChemPFN(pl.LightningModule):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
-        # Descriptor normalization (set from training data)
-        self.register_buffer("desc_mean", torch.zeros(N_DESC))
-        self.register_buffer("desc_std", torch.ones(N_DESC))
-
-    def forward(self, x, y, query_mask, task="training"):
+    def forward(self, x, y, query_mask, task="regression"):
         d_model = self.hparams.d_model
 
         if isinstance(x, BatchCuikMolGraph):
@@ -67,14 +59,9 @@ class ChemPFN(pl.LightningModule):
             x_tok = x
             device = x.device
 
-        if task == "training":
-            # Training: descriptors
-            y_norm = (y - self.desc_mean.to(device)) / self.desc_std.to(device)
-            y_tok = self.y_proj_desc(y_norm)
-        elif task == "regression":
+        if task == "regression":
             y_tok = self.y_proj_reg(y)
         else:
-            # classification
             y_tok = self.y_embed_cls(y.clamp(min=0))
 
         mask_tok = self.query_mask_token.view(1, 1, -1).expand_as(y_tok)
@@ -84,12 +71,9 @@ class ChemPFN(pl.LightningModule):
         q = query_mask.squeeze(-1)
         out = self.transformer(tokens, src_key_padding_mask=q)
 
-        if task == "training":
-            return self.head_desc(out)
-        elif task == "regression":
+        if task == "regression":
             return self.head_reg(out)
-        else:
-            return self.head_cls(out)
+        return self.head_cls(out)
 
     def training_step(self, batch, batch_idx):
         graph, y = batch
@@ -99,20 +83,32 @@ class ChemPFN(pl.LightningModule):
         B, N, D = 1, y.shape[1], y.shape[2]
         query_mask = torch.rand(B, N, 1, device=self.device) > 0.5
 
-        # Descriptor dropout: randomly zero out 50-80% of descriptors per batch
-        dropout_rate = torch.empty(1, device=self.device).uniform_(0.5, 0.8).item()
-        desc_keep_mask = torch.rand(B, N, D, device=self.device) > dropout_rate
+        # Pick a random descriptor dimension
+        d_idx = torch.randint(0, D, (1,)).item()
+        y_single = y[:, :, d_idx:d_idx + 1]  # (1, N, 1)
 
-        preds = self(graph, y, query_mask, task="training")
-        q = query_mask.squeeze(-1)
+        opt = self.optimizers()
 
-        # Flatten query-only predictions and targets, apply descriptor mask
-        pred_flat = preds[q]    # (sum(q), D)
-        y_flat = y[q]          # (sum(q), D)
-        mask_flat = desc_keep_mask[q]  # (sum(q), D)
+        if torch.rand(1).item() > 0.5:
+            # --- REGRESSION ---
+            preds = self(graph, y_single, query_mask, task="regression")
+            q = query_mask.squeeze(-1)
+            loss = F.mse_loss(preds[q], y_single[q])
+            self.log("train_loss_reg", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=N)
+        else:
+            # --- BINARY CLASSIFICATION ---
+            # Threshold at batch median
+            q = query_mask.squeeze(-1)
+            context_vals = y_single[~q, 0]  # context-only values
+            if context_vals.numel() > 1:
+                median = context_vals.median()
+            else:
+                median = context_vals.mean()
+            y_cls = (y_single[:, :, 0] >= median).long()  # (1, N)
 
-        squared_error = (pred_flat - y_flat) ** 2
-        loss = squared_error.sum() / (mask_flat.sum() + 1e-8)
+            preds = self(graph, y_cls, query_mask, task="classification")
+            loss = F.cross_entropy(preds[..., :2][q], y_cls[q])
+            self.log("train_loss_cls", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=N)
 
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=N)
         return loss
@@ -124,7 +120,7 @@ class ChemPFN(pl.LightningModule):
         if task == "regression":
             labels_raw = torch.tensor(train_labels, dtype=torch.float32, device=self.device)
             y_mean, y_std = labels_raw.mean(), labels_raw.std() + 1e-6
-            labels_proc = ((labels_raw - y_mean) / y_std).unsqueeze(-1)  # (n_train, 1)
+            labels_proc = ((labels_raw - y_mean) / y_std).unsqueeze(-1)
         else:
             assert n_classes is not None, "pass n_classes for classification"
             labels_proc = torch.tensor(train_labels, dtype=torch.long, device=self.device)

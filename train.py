@@ -36,15 +36,11 @@ def make_collate_fn(smiles_list, desc_tensor, min_n=64, max_n=1_024):
 
 
 def run_training(smiles_list, max_epochs=512):
-    # Precompute and normalize descriptors
     print("Computing RDKit descriptors for training set...")
     raw_desc = get_rdkit_descriptors(smiles_list)
     print(f"Descriptor shape: {raw_desc.shape}")
 
-    raw_t = torch.tensor(raw_desc, dtype=torch.float32)
-    desc_mean = raw_t.mean(dim=0)
-    desc_std = raw_t.std(dim=0) + 1e-6
-    desc_normalized = (raw_t - desc_mean) / desc_std
+    desc_tensor = torch.tensor(raw_desc, dtype=torch.float32)
 
     dataset = SmilesDataset(smiles_list)
     dataloader = DataLoader(
@@ -52,12 +48,10 @@ def run_training(smiles_list, max_epochs=512):
         batch_size=32,  # does nothing, is set by collate_fn
         num_workers=2,
         shuffle=True,
-        collate_fn=make_collate_fn(smiles_list, desc_normalized),
+        collate_fn=make_collate_fn(smiles_list, desc_tensor),
     )
 
     model = ChemPFN()
-    model.desc_mean = desc_mean
-    model.desc_std = desc_std
 
     logger = TensorBoardLogger(save_dir="logs/", default_hp_metric=False)
 
@@ -80,6 +74,7 @@ def run_training(smiles_list, max_epochs=512):
         max_epochs=max_epochs,
         accelerator="auto",
         devices="auto",
+        strategy=DDPStrategy(find_unused_parameters=True),
         logger=logger,
         callbacks=[early_stop_callback, model_checkpoint_callback],
         default_root_dir=logger.log_dir,
