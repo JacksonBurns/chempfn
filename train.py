@@ -4,6 +4,7 @@ import torch
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.strategies import DDPStrategy
 from torch.utils.data import Dataset, DataLoader
 from model import ChemPFN
 from features import get_featurizer, FEATURIZER, get_rdkit_descriptors
@@ -82,6 +83,7 @@ def run_training(smiles_list, max_epochs=512):
         logger=logger,
         callbacks=[early_stop_callback, model_checkpoint_callback],
         default_root_dir=logger.log_dir,
+        strategy=DDPStrategy(find_unused_parameters=True),
     )
 
     trainer.fit(model, dataloader)

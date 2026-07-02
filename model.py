@@ -114,7 +114,7 @@ class ChemPFN(pl.LightningModule):
         squared_error = (pred_flat - y_flat) ** 2
         loss = squared_error.sum() / (mask_flat.sum() + 1e-8)
 
-        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=N)
         return loss
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0, task="regression",
