@@ -58,6 +58,11 @@ Chemistry datasets are often imbalanced (few actives among many inactives). Addi
 1. ~~Normalize fingerprints with log1p~~ — Added `torch.log1p(x_fp.clamp(min=0))` before fp_proj
 2. ~~Increase max_classes to 4~~ — Updated default from 2 to 4
 3. ~~Fix depth variable shadowing~~ — Renamed loop variable to `n_layers`
+4. ~~Input-level feature dropout in prior generator~~ — Randomly blanks 50-80% of features per prior to simulate targets that depend on only a few descriptors
+
+### Phase 3: Optional Enhancements (deferred)
+1. Add class-weighted loss — would need dataset-specific class distribution estimates
+2. Consider molecule graph features beyond fingerprints — would require architectural changes
 
 ### Phase 3: Optional Enhancements (deferred)
 1. Add class-weighted loss — would need dataset-specific class distribution estimates
@@ -75,5 +80,6 @@ Initially flagged as "Critical" and then implemented as a learned positional emb
 - Forward pass (regression): ✅ output (B, N, 1)
 - Forward pass (classification): ✅ output (B, N, 4)
 - Synthetic prior generation: ✅ both tasks
+- Synthetic prior generation with feature dropout: ✅
 - Inference module import: ✅
 - Permutation equivariance: ✅ context reordering produces equivalent query outputs

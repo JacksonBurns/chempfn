@@ -112,7 +112,13 @@ class ChemPFN(pl.LightningModule):
         device = self.device
         n_layers = torch.randint(1, 4, (1,)).item()
         activations = [F.relu, torch.tanh, F.gelu]
-        h, in_dim = x, D
+
+        # Feature dropout: blank out 50-80% of features per prior to simulate
+        # chemistry targets that depend on only a few descriptors/fingerprint bits
+        dropout_rate = torch.empty(1, device=device).uniform_(0.5, 0.8).item()
+        keep_mask = torch.rand(B, 1, D, device=device) > dropout_rate
+        h = x * keep_mask
+        in_dim = D
 
         for _ in range(n_layers):
             if torch.rand(1).item() > 0.5:
