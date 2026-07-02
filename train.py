@@ -47,7 +47,7 @@ def run_training(smiles_list, max_epochs=512):
     dataset = PFNSyntheticDataset(X_normalized)
     dataloader = DataLoader(
         dataset,
-        batch_size=16,
+        batch_size=32,
         num_workers=2,
         shuffle=True,
         collate_fn=make_collate_fn(X_normalized),
@@ -85,7 +85,7 @@ def run_training(smiles_list, max_epochs=512):
 
 if __name__ == "__main__":
     torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
-    torch.set_float32_matmul_precision('medium')
+
     pl.seed_everything(42)
     with open("cleaned_pubchem_1MM.smiles", "r") as file:
         smiles = [line.strip() for line in file.readlines()]
