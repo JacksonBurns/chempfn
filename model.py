@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,6 +18,45 @@ def _move_graph_to(graph, device):
         if v is not None:
             setattr(graph, field, v.to(device))
     return graph
+
+
+def _random_mlp_hyperdescriptor(y_subset, H, device):
+    """Create a scalar hyperdescriptor from a subset of descriptors via a random MLP.
+
+    Randomly chooses depth in {0, 1, 2}:
+      0: linear (K → 1)
+      1: one hidden (K → H → 1)
+      2: two hidden (K → H → H → 1)
+
+    y_subset: (1, N, K) — selected descriptor columns
+    Returns: (1, N, 1) zero-mean, unit-var scalar
+    """
+    B, N, K = y_subset.shape
+    depth = torch.randint(0, 3, (1,)).item()
+
+    if depth == 0:
+        W = torch.randn(B, K, 1, device=device) / math.sqrt(K)
+        out = torch.bmm(y_subset, W)
+    elif depth == 1:
+        W1 = torch.randn(B, K, H, device=device) / math.sqrt(K)
+        b1 = torch.randn(B, 1, H, device=device) * 0.1
+        h = torch.tanh(torch.bmm(y_subset, W1) + b1)
+        W2 = torch.randn(B, H, 1, device=device) / math.sqrt(H)
+        b2 = torch.randn(B, 1, 1, device=device) * 0.1
+        out = torch.bmm(h, W2) + b2
+    else:
+        W1 = torch.randn(B, K, H, device=device) / math.sqrt(K)
+        b1 = torch.randn(B, 1, H, device=device) * 0.1
+        h = torch.tanh(torch.bmm(y_subset, W1) + b1)
+        W2 = torch.randn(B, H, H, device=device) / math.sqrt(H)
+        b2 = torch.randn(B, 1, H, device=device) * 0.1
+        h = torch.tanh(torch.bmm(h, W2) + b2)
+        W3 = torch.randn(B, H, 1, device=device) / math.sqrt(H)
+        b3 = torch.randn(B, 1, 1, device=device) * 0.1
+        out = torch.bmm(h, W3) + b3
+
+    out = (out - out.mean(dim=1, keepdim=True)) / (out.std(dim=1, keepdim=True) + 1e-6)
+    return out
 
 
 class ChemPFN(pl.LightningModule):
@@ -81,26 +121,31 @@ class ChemPFN(pl.LightningModule):
         B, N, D = 1, y.shape[1], y.shape[2]
         query_mask = torch.rand(B, N, 1, device=self.device) > 0.5
 
-        # Pick a random descriptor dimension
-        d_idx = torch.randint(0, D, (1,)).item()
-        y_single = y[:, :, d_idx:d_idx + 1]  # (1, N, 1)
+        # Randomly select a subset of descriptors (10-50% of available)
+        K = torch.randint(max(5, D // 20), max(10, D // 2), (1,)).item()
+        k_idx = torch.randperm(D, device=self.device)[:K]
+        y_subset = y[:, :, k_idx]  # (1, N, K)
+
+        # Pass through random MLP → scalar hyperdescriptor
+        H = 32
+        y_hyper = _random_mlp_hyperdescriptor(y_subset, H, self.device)  # (1, N, 1)
 
         if torch.rand(1).item() > 0.5:
             # --- REGRESSION ---
-            preds = self(graph, y_single, query_mask, task="regression")
+            preds = self(graph, y_hyper, query_mask, task="regression")
             q = query_mask.squeeze(-1)
-            loss = F.mse_loss(preds[q], y_single[q])
+            loss = F.mse_loss(preds[q], y_hyper[q])
             self.log("train_loss_reg", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=N)
         else:
             # --- BINARY CLASSIFICATION ---
             # Threshold at batch median
             q = query_mask.squeeze(-1)
-            context_vals = y_single[~q, 0]  # context-only values
+            context_vals = y_hyper[~q, 0]
             if context_vals.numel() > 1:
                 median = context_vals.median()
             else:
                 median = context_vals.mean()
-            y_cls = (y_single[:, :, 0] >= median).long()  # (1, N)
+            y_cls = (y_hyper[:, :, 0] >= median).long()
 
             preds = self(graph, y_cls, query_mask, task="classification")
             loss = F.cross_entropy(preds[..., :2][q], y_cls[q])
