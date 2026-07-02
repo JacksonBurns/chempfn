@@ -196,7 +196,7 @@ class ChemPFN(pl.LightningModule):
         # --- SAM Pass 2: Calculate gradients at the sharp point to update weights ---
         total_loss_2, _, _ = compute_loss()
         self.manual_backward(total_loss_2)
-        opt.second_step(zero_grad=True)
+        opt.step(zero_grad=True)
 
         # 3. Comprehensive Logging
         self.log("train_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)

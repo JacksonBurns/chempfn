@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
@@ -57,19 +59,21 @@ def run_training(smiles_list, max_epochs=512):
     model.X_mean = X_mean
     model.X_std = X_std
     
-    logger = TensorBoardLogger(save_dir="logs/", name="chem_pfn_experiment", default_hp_metric=False)
+    logger = TensorBoardLogger(save_dir="logs/", default_hp_metric=False)
     
     early_stop_callback = EarlyStopping(
         monitor="train_loss_epoch", 
         patience=10,
-        mode="min"
+        mode="min",
+        check_on_train_epoch_end=True,
     )
     model_checkpoint_callback = ModelCheckpoint(
         monitor="train_loss_epoch",
-        dirpath=logger.log_dir,
-        filename="best_model",
+        dirpath=Path(logger.log_dir) / "checkpoints",
+        filename="model-{epoch:02d}-{train_loss_epoch:.4f}",
         save_top_k=1,
-        mode="min"
+        mode="min",
+        save_on_train_epoch_end=True,
     )
     
     trainer = pl.Trainer(
