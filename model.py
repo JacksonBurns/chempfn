@@ -22,7 +22,7 @@ class DenseCountEmbeddingBag(nn.Module):
 
 class ChemPFN(pl.LightningModule):
     def __init__(self, d_desc, d_fp=2048, d_model=512, n_heads=4, n_layers=8, lr=1e-4,
-                 hidden_dim=256, max_classes=2):
+                 hidden_dim=256, max_classes=4):
         super().__init__()
         self.save_hyperparameters()
 
@@ -52,10 +52,13 @@ class ChemPFN(pl.LightningModule):
 
     def forward(self, x, y, query_mask, task="regression"):
         d_desc = self.hparams.d_desc
-        
+
         # Split the raw input tensor
         x_desc = x[..., :d_desc]
         x_fp = x[..., d_desc:]
+
+        # Normalize count fingerprints (log1p brings sparse counts to manageable range)
+        x_fp = torch.log1p(x_fp.clamp(min=0))
 
         # Project and sum
         desc_tok = self.desc_proj(x_desc)
@@ -66,15 +69,20 @@ class ChemPFN(pl.LightningModule):
         task_tok = self.task_embed(task_idx).view(1, 1, -1)
 
         if task == "regression":
-            y_masked = y.masked_fill(query_mask, 0.0)
-            y_tok = self.y_proj_reg(y_masked)
+            y_tok = self.y_proj_reg(y)
+            mask_tok = self.query_mask_token.view(1, 1, -1).expand_as(y_tok)
+            y_tok = torch.where(query_mask, mask_tok, y_tok)
         else:
             y_tok = self.y_embed_cls(y.clamp(min=0))
             mask_tok = self.query_mask_token.view(1, 1, -1).expand_as(y_tok)
             y_tok = torch.where(query_mask, mask_tok, y_tok)
 
         tokens = x_tok + y_tok + task_tok
-        out = self.transformer(tokens)
+
+        # Attention mask: mask out query positions from key attention
+        # src_key_padding_mask is (B, N) where True = don't attend to this key position
+        q = query_mask.squeeze(-1)  # (B, N)
+        out = self.transformer(tokens, src_key_padding_mask=q)
         return self.head_reg(out) if task == "regression" else self.head_cls(out)
 
     def _random_mlp_layer(self, h, in_dim, H, act, device):
@@ -93,7 +101,7 @@ class ChemPFN(pl.LightningModule):
             feat_vals = torch.gather(h, 2, feat_idx.unsqueeze(1).expand(B, N, depth))
             thresholds = torch.randn(B, 1, depth, device=device) * 0.5
             bits = (feat_vals > thresholds).long()
-            leaf_idx = (bits * powers).sum(-1)  
+            leaf_idx = (bits * powers).sum(-1)
             leaf_values = torch.randn(B, n_leaves, H, device=device) / math.sqrt(depth + 1)
             out = out + torch.gather(leaf_values, 1, leaf_idx.unsqueeze(-1).expand(B, N, H))
         return out / n_trees
@@ -102,42 +110,42 @@ class ChemPFN(pl.LightningModule):
         B, N, D = x.shape
         H = self.hparams.hidden_dim
         device = self.device
-        depth = torch.randint(1, 4, (1,)).item()
+        n_layers = torch.randint(1, 4, (1,)).item()
         activations = [F.relu, torch.tanh, F.gelu]
         h, in_dim = x, D
 
-        for _ in range(depth):
+        for _ in range(n_layers):
             if torch.rand(1).item() > 0.5:
                 act = activations[torch.randint(0, len(activations), (1,)).item()]
                 h = self._random_mlp_layer(h, in_dim, H, act, device)
             else:
                 h = self._random_tree_layer(h, H, device)
             in_dim = H
-            
+
         W_out = torch.randn(B, in_dim, 1, device=device) / math.sqrt(in_dim)
         raw = torch.bmm(h, W_out)
         raw = raw + torch.randn_like(raw) * (torch.rand(B, 1, 1, device=device) * 0.1)
-        
+
         if task == "regression":
             targets = (raw - raw.mean(1, keepdim=True)) / (raw.std(1, keepdim=True) + 1e-6)
-            
+
             # --- CHEMINFORMATICS REALITY: Zero-Inflated / Clipped Assays ---
             # 50% chance to simulate a lower limit of detection (LOD)
             if torch.rand(1).item() > 0.5:
                 q_floor = torch.rand(1, device=device).item() * 0.25 # Clip bottom 0-25%
                 floor_val = torch.quantile(targets, q_floor, dim=1, keepdim=True)
                 targets = torch.max(targets, floor_val)
-            
+
             # 25% chance to also simulate an upper assay saturation point
             if torch.rand(1).item() > 0.75:
                 q_ceil = 1.0 - (torch.rand(1, device=device).item() * 0.25)
                 ceil_val = torch.quantile(targets, q_ceil, dim=1, keepdim=True)
                 targets = torch.min(targets, ceil_val)
-                
-            return targets  
-            
+
+            return targets
+
         n_classes = torch.randint(2, self.hparams.max_classes + 1, (1,)).item()
-        
+
         # --- CHEMINFORMATICS REALITY: Extreme Class Imbalance ---
         if n_classes == 2:
             # Random active class ratio between 1% and 50%
@@ -147,11 +155,11 @@ class ChemPFN(pl.LightningModule):
             # For multi-class, randomly skew bucket sizes instead of linspace
             qs = torch.rand(n_classes - 1, device=device).sort()[0]
 
-        edges = torch.quantile(raw.squeeze(-1), qs, dim=1).transpose(0, 1)  
+        edges = torch.quantile(raw.squeeze(-1), qs, dim=1).transpose(0, 1)
         labels = torch.zeros(B, N, dtype=torch.long, device=device)
         for c in range(n_classes - 1):
             labels += (raw.squeeze(-1) > edges[:, c:c + 1]).long()
-            
+
         return labels, n_classes
 
     def training_step(self, batch, batch_idx):
