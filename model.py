@@ -41,7 +41,6 @@ class ChemPFN(pl.LightningModule):
         self.y_embed_cls = nn.Embedding(max_classes, d_model)
         self.query_mask_token = nn.Parameter(torch.randn(d_model) * 0.02)
         self.task_embed = nn.Embedding(2, d_model)  # 0=regression, 1=classification
-        self.pos_embedding = nn.Parameter(torch.randn(1024, d_model) * 0.01)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 4,
@@ -79,10 +78,6 @@ class ChemPFN(pl.LightningModule):
             y_tok = torch.where(query_mask, mask_tok, y_tok)
 
         tokens = x_tok + y_tok + task_tok
-
-        # Positional encoding: essential for ICL to distinguish context vs query positions
-        N = tokens.shape[1]
-        tokens = tokens + self.pos_embedding[:N].unsqueeze(0)
 
         # Attention mask: mask out query positions from key attention
         # src_key_padding_mask is (B, N) where True = don't attend to this key position
