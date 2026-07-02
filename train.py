@@ -78,6 +78,7 @@ def run_training(smiles_list, max_epochs=512):
         devices="auto",
         logger=logger,
         callbacks=[early_stop_callback, model_checkpoint_callback],
+        default_root_dir=logger.log_dir,
     )
     
     trainer.fit(model, dataloader)
