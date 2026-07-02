@@ -27,7 +27,7 @@ def make_collate_fn(X_full, min_n=64, max_n=1_024):
         return X_full[idx] 
     return collate_fn
 
-def run_training(smiles_list, max_epochs=512):
+def run_training(smiles_list, max_epochs=64):
     X_raw = get_rdkit_features(smiles_list)
     
     # RDKit Morgan count fingerprint features are exactly 2048 long based on features.py

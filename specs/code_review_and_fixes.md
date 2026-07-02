@@ -2,6 +2,9 @@
 
 ## Critical Bugs
 
+### 0. No Gradient Clamping (model.py, training_step)
+**Severity: Medium** — Synthetic prior generation produces inherently volatile loss between steps (random targets, feature dropout, random batch sizes). Without gradient clipping, SAM's two-pass update amplifies spikes from outlier batches, destabilizing training.
+
 ### 1. Label Leakage in Regression (model.py, line 69-70)
 **Severity: High** — `y_masked = y.masked_fill(query_mask, 0.0)` fills query positions with 0. Because labels are normalized to zero-mean, a masked value of 0.0 is the *expected value* — not a neutral sentinel. The model receives a signal that query positions have "average" labels. TabPFN uses a learnable `[MASK]` token for this purpose.
 
@@ -53,16 +56,16 @@ Chemistry datasets are often imbalanced (few actives among many inactives). Addi
 1. ~~Use learnable mask token for regression (not 0.0)~~ — Regression now uses same `query_mask_token` as classification
 2. ~~Add proper attention mask to transformer~~ — Query positions masked from key attention (no cross-query leakage)
 3. ~~Fix double softmax in inference.py~~ — Removed erroneous `.softmax(dim=0)` on already-softmaxed output
+4. ~~Add gradient clipping~~ — Global norm clip at 1.0 before both SAM passes
+5. ~~Add LR warmup~~ — Linear warmup from 1% to 100% over first 10% of training steps
 
 ### Phase 2: Performance Improvements ✅ COMPLETE
 1. ~~Normalize fingerprints with log1p~~ — Added `torch.log1p(x_fp.clamp(min=0))` before fp_proj
 2. ~~Increase max_classes to 4~~ — Updated default from 2 to 4
 3. ~~Fix depth variable shadowing~~ — Renamed loop variable to `n_layers`
 4. ~~Input-level feature dropout in prior generator~~ — Randomly blanks 50-80% of features per prior to simulate targets that depend on only a few descriptors
-
-### Phase 3: Optional Enhancements (deferred)
-1. Add class-weighted loss — would need dataset-specific class distribution estimates
-2. Consider molecule graph features beyond fingerprints — would require architectural changes
+5. ~~Gradient clipping~~ — Global norm clip at 1.0 before both SAM passes to prevent outlier batches from destabilizing updates
+6. ~~Linear warmup + cosine annealing LR schedule~~ — Warms up from 1% to 100% of target LR over first 10% of training steps, then cosine anneals to 10% floor. Stabilizes early training when gradients are volatile from random synthetic targets
 
 ### Phase 3: Optional Enhancements (deferred)
 1. Add class-weighted loss — would need dataset-specific class distribution estimates
@@ -81,5 +84,6 @@ Initially flagged as "Critical" and then implemented as a learned positional emb
 - Forward pass (classification): ✅ output (B, N, 4)
 - Synthetic prior generation: ✅ both tasks
 - Synthetic prior generation with feature dropout: ✅
+- LR warmup + cosine schedule: ✅ correct ramp-up and decay
 - Inference module import: ✅
 - Permutation equivariance: ✅ context reordering produces equivalent query outputs

@@ -197,11 +197,13 @@ class ChemPFN(pl.LightningModule):
         # --- SAM Pass 1: Climb to the sharpest point in the joint neighborhood ---
         total_loss, loss_reg, loss_cls = compute_loss()
         self.manual_backward(total_loss)
+        self.clip_gradients(opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
         opt.first_step(zero_grad=True)
 
         # --- SAM Pass 2: Calculate gradients at the sharp point to update weights ---
         total_loss_2, _, _ = compute_loss()
         self.manual_backward(total_loss_2)
+        self.clip_gradients(opt, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
         opt.step(zero_grad=True)
 
         # 3. Comprehensive Logging
@@ -211,6 +213,10 @@ class ChemPFN(pl.LightningModule):
         
         # Log the sharpness penalty (how much worse the joint loss gets after the SAM step)
         self.log("train_loss_sam_penalty", total_loss_2 - total_loss, on_step=True, on_epoch=True, sync_dist=True)
+
+        # learning rate logging
+        lr = opt.param_groups[0]["lr"]
+        self.log("learning_rate", lr, on_step=True, on_epoch=True, sync_dist=True)
 
         return total_loss.detach()
 
@@ -278,7 +284,34 @@ class ChemPFN(pl.LightningModule):
         return preds_sum 
     
     def configure_optimizers(self):
-        # Wrap AdamW inside our SAM optimizer
+
+        total_steps = self.trainer.estimated_stepping_batches
+        steps_per_epoch = total_steps // self.trainer.max_epochs
+
         base_opt = torch.optim.AdamW
-        # rho=0.05 is the standard SAM neighborhood size
-        return SAM(self.parameters(), base_opt, lr=self.hparams.lr, rho=0.05)
+        optimizer = SAM(self.parameters(), base_opt, lr=self.hparams.lr, rho=0.05)
+
+        # Linear warmup from near-zero LR to target LR, then cosine anneal to 10% of target
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=0.01,
+            end_factor=1.0,
+            total_iters=steps_per_epoch,
+        )
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=total_steps - steps_per_epoch,
+            eta_min=self.hparams.lr * 0.1,
+        )
+        scheduler = torch.optim.lr_scheduler.ChainedScheduler(
+            [warmup_scheduler, cosine_scheduler]
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
