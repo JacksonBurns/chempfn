@@ -126,4 +126,4 @@ if __name__ == "__main__":
     )
     print("Class probabilities:\n", cls_probs)
     print("Predicted classes:", cls_probs.argmax(dim=-1).tolist())
-    print("Predicted binary probability:", cls_probs.softmax(dim=0)[:, 1].tolist())
+    print("Predicted binary probability:", cls_probs[:, 1].tolist())
