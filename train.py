@@ -7,10 +7,10 @@ from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.strategies import DDPStrategy
 from torch.utils.data import Dataset, DataLoader
-from model import ChemPFN
-from features import get_featurizer, FEATURIZER, get_rdkit_descriptors
 
-featurizer = get_featurizer(FEATURIZER)
+from model import ChemPFN
+
+from model import featurizer
 
 
 class SmilesDataset(Dataset):
@@ -25,27 +25,21 @@ class SmilesDataset(Dataset):
         return idx
 
 
-def make_collate_fn(smiles_list, desc_tensor, min_n=64, max_n=1_024):
+def make_collate_fn(smiles_list, min_n=64, max_n=1_024):
     def collate_fn(batch):
         n_samples = torch.randint(min_n, max_n + 1, (1,)).item()
         idx = torch.randint(0, len(smiles_list), (n_samples,)).tolist()
+        
+        # Pass the SMILES strings directly into the featurizer all at once
         selected = [smiles_list[i] for i in idx]
         graph = featurizer(selected)
-        descs = desc_tensor[idx]
-        return graph, descs
+        
+        return (graph,)
     return collate_fn
 
 
 def run_training(smiles_list, max_epochs=512, training_task="regression", init_from=None):
     print(f"=== Phase: {training_task} pre-training ===")
-    print("Computing RDKit descriptors for training set...")
-    raw_desc = get_rdkit_descriptors(smiles_list)
-    print(f"Descriptor shape: {raw_desc.shape}")
-
-    raw_t = torch.tensor(raw_desc, dtype=torch.float32)
-    desc_mean = raw_t.mean(dim=0)
-    desc_std = raw_t.std(dim=0) + 1e-6
-    desc_tensor = (raw_t - desc_mean) / desc_std
 
     dataset = SmilesDataset(smiles_list)
     dataloader = DataLoader(
@@ -53,7 +47,7 @@ def run_training(smiles_list, max_epochs=512, training_task="regression", init_f
         batch_size=32,
         num_workers=2,
         shuffle=True,
-        collate_fn=make_collate_fn(smiles_list, desc_tensor),
+        collate_fn=make_collate_fn(smiles_list),
     )
 
     if init_from and Path(init_from).exists():
