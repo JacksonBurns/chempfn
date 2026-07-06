@@ -63,7 +63,7 @@ def run_training(smiles_list, max_epochs=512, training_task="regression", init_f
 
     early_stop_callback = EarlyStopping(
         monitor="train_loss_epoch",
-        patience=20,
+        patience=30,
         mode="min",
         check_on_train_epoch_end=True,
     )
