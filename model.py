@@ -33,17 +33,17 @@ def _random_mlp_hyperdescriptor(y_subset, H, device):
     elif depth == 1:
         W1 = torch.randn(B, K, H, device=device) / math.sqrt(K)
         b1 = torch.randn(B, 1, H, device=device) * 0.1
-        h = torch.tanh(torch.bmm(y_subset, W1) + b1)
+        h = torch.relu(torch.bmm(y_subset, W1) + b1)
         W2 = torch.randn(B, H, 1, device=device) / math.sqrt(H)
         b2 = torch.randn(B, 1, 1, device=device) * 0.1
         out = torch.bmm(h, W2) + b2
     else:
         W1 = torch.randn(B, K, H, device=device) / math.sqrt(K)
         b1 = torch.randn(B, 1, H, device=device) * 0.1
-        h = torch.tanh(torch.bmm(y_subset, W1) + b1)
+        h = torch.relu(torch.bmm(y_subset, W1) + b1)
         W2 = torch.randn(B, H, H, device=device) / math.sqrt(H)
         b2 = torch.randn(B, 1, H, device=device) * 0.1
-        h = torch.tanh(torch.bmm(h, W2) + b2)
+        h = torch.relu(torch.bmm(h, W2) + b2)
         W3 = torch.randn(B, H, 1, device=device) / math.sqrt(H)
         b3 = torch.randn(B, 1, 1, device=device) * 0.1
         out = torch.bmm(h, W3) + b3
@@ -54,7 +54,7 @@ def _random_mlp_hyperdescriptor(y_subset, H, device):
 
 class ChemPFN(pl.LightningModule):
     def __init__(self, d_model=512, n_heads=4, n_layers=8, lr=1e-4,
-                 max_classes=4, training_task="regression"):
+                 max_classes=4, training_task="regression", d_task=32):
         super().__init__()
         self.save_hyperparameters()
 
@@ -77,21 +77,21 @@ class ChemPFN(pl.LightningModule):
         for param in self.chemeleon_encoder.parameters():
             param.requires_grad = False
 
-        # Projection head to reduce to d_model - 128
-        self.x_proj = nn.Linear(self.chemeleon_encoder.output_dim, d_model - 128)
+        # Projection head to reduce to d_model - d_task
+        self.x_proj = nn.Linear(self.chemeleon_encoder.output_dim, d_model - d_task)
 
         # Regression: single scalar label projection
-        self.y_proj_reg = nn.Linear(1, 128)
+        self.y_proj_reg = nn.Linear(1, d_task)
         # Head takes the fully concatenated output from the transformer (d_model)
         self.head_reg = nn.Linear(d_model, 1)
 
         # Classification: class embedding
-        self.y_embed_cls = nn.Embedding(max_classes, 128)
+        self.y_embed_cls = nn.Embedding(max_classes, d_task)
         # Head takes the fully concatenated output from the transformer (d_model)
         self.head_cls = nn.Linear(d_model, max_classes)
 
         # Use nn.Embedding so it registers as a distinct module in the PyTorch Lightning summary
-        self.query_mask_token = nn.Embedding(1, 128)
+        self.query_mask_token = nn.Embedding(1, d_task)
         nn.init.normal_(self.query_mask_token.weight, mean=0.0, std=0.02)
 
         # Transformer expects exactly d_model
@@ -123,7 +123,7 @@ class ChemPFN(pl.LightningModule):
         mask_tok = self.query_mask_token.weight.view(1, 1, -1).expand_as(y_tok)
         y_tok = torch.where(query_mask, mask_tok, y_tok)
 
-        # Concatenate X_tok (d_model - 128) and y_tok (128) rather than summing -> d_model
+        # Concatenate X_tok (d_model - d_task) and y_tok (d_task) rather than summing -> d_model
         tokens = torch.cat([x_tok, y_tok], dim=-1)
         q = query_mask.squeeze(-1)
         
