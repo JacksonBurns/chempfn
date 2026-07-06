@@ -1,6 +1,7 @@
 .rdkit_feature_cache
 logs
 *.smiles
+*.ckpt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

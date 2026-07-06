@@ -17,8 +17,8 @@ if __name__ == "__main__":
     output_file = open("eval_results.md", "w")
     output_file.write(
         f"""# Eval Results
-timestamp: {datetime.datetime.now()}
 
+timestamp: {datetime.datetime.now()}
 """
     )
     performance_dict = {}
