@@ -90,8 +90,9 @@ class ChemPFN(pl.LightningModule):
         # Head takes the fully concatenated output from the transformer (d_model)
         self.head_cls = nn.Linear(d_model, max_classes)
 
-        # Mask token must match the embedding size of y_tok
-        self.query_mask_token = nn.Parameter(torch.randn(128) * 0.02)
+        # Use nn.Embedding so it registers as a distinct module in the PyTorch Lightning summary
+        self.query_mask_token = nn.Embedding(1, 128)
+        nn.init.normal_(self.query_mask_token.weight, mean=0.0, std=0.02)
 
         # Transformer expects exactly d_model
         encoder_layer = nn.TransformerEncoderLayer(
@@ -118,7 +119,8 @@ class ChemPFN(pl.LightningModule):
         else:
             y_tok = self.y_embed_cls(y.clamp(min=0))
 
-        mask_tok = self.query_mask_token.view(1, 1, -1).expand_as(y_tok)
+        # Extract the weight from the embedding module to use as the token
+        mask_tok = self.query_mask_token.weight.view(1, 1, -1).expand_as(y_tok)
         y_tok = torch.where(query_mask, mask_tok, y_tok)
 
         # Concatenate X_tok (d_model - 128) and y_tok (128) rather than summing -> d_model
