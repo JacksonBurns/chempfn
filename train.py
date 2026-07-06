@@ -36,7 +36,8 @@ def make_collate_fn(smiles_list, desc_tensor, min_n=64, max_n=1_024):
     return collate_fn
 
 
-def run_training(smiles_list, max_epochs=512):
+def run_training(smiles_list, max_epochs=512, training_task="regression", init_from=None):
+    print(f"=== Phase: {training_task} pre-training ===")
     print("Computing RDKit descriptors for training set...")
     raw_desc = get_rdkit_descriptors(smiles_list)
     print(f"Descriptor shape: {raw_desc.shape}")
@@ -49,22 +50,22 @@ def run_training(smiles_list, max_epochs=512):
     dataset = SmilesDataset(smiles_list)
     dataloader = DataLoader(
         dataset,
-        batch_size=32,  # actually ends up being number of steps per epoch, since we sample a random number of molecules each time
+        batch_size=32,
         num_workers=2,
         shuffle=True,
         collate_fn=make_collate_fn(smiles_list, desc_tensor),
     )
 
-    if (ckpt := Path(os.environ.get("INIT_FROM_CHECKPOINT"))).exists():
-        print(f"Initializing model from checkpoint: {ckpt}")
-        model = ChemPFN.load_from_checkpoint(ckpt)
-        # override learning rate
-        model.hparams.lr = 1e-5
+    if init_from and Path(init_from).exists():
+        print(f"Initializing from checkpoint: {init_from}")
+        model = ChemPFN.load_from_checkpoint(init_from)
+        model.hparams.training_task = training_task
     else:
-        print("Initializing new model (set INIT_FROM_CHECKPOINT to initialize from checkpoint)...")
-        model = ChemPFN()
+        model = ChemPFN(training_task=training_task)
 
-    logger = TensorBoardLogger(save_dir="logs/", default_hp_metric=False)
+    logger = TensorBoardLogger(
+        save_dir=f"logs/{training_task}/", default_hp_metric=False
+    )
 
     early_stop_callback = EarlyStopping(
         monitor="train_loss_epoch",
@@ -85,14 +86,16 @@ def run_training(smiles_list, max_epochs=512):
         max_epochs=max_epochs,
         accelerator="auto",
         devices="auto",
-        strategy=DDPStrategy(find_unused_parameters=True),  # regression and classification head are not always used in the same forward pass
+        strategy=DDPStrategy(find_unused_parameters=True),
         logger=logger,
         callbacks=[early_stop_callback, model_checkpoint_callback],
         default_root_dir=logger.log_dir,
     )
 
     trainer.fit(model, dataloader)
-    print(f"Training complete. Logs available in: {logger.log_dir}")
+    print(f"Phase {training_task} complete. Logs: {logger.log_dir}")
+
+    return model_checkpoint_callback.best_model_path
 
 
 if __name__ == "__main__":
@@ -101,4 +104,13 @@ if __name__ == "__main__":
     pl.seed_everything(42)
     with open("cleaned_pubchem_1MM.smiles", "r") as file:
         smiles = [line.strip() for line in file.readlines()]
-    run_training(smiles)
+
+    # Phase 1: Regression pre-training from scratch
+    reg_ckpt = run_training(smiles, max_epochs=512, training_task="regression")
+
+    # Phase 2: Classification pre-training from scratch
+    cls_ckpt = run_training(smiles, max_epochs=512, training_task="classification")
+
+    print(f"Both phases complete.")
+    print(f"  Regression checkpoint: {reg_ckpt}")
+    print(f"  Classification checkpoint: {cls_ckpt}")

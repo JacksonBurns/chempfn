@@ -61,7 +61,7 @@ def _random_mlp_hyperdescriptor(y_subset, H, device):
 
 class ChemPFN(pl.LightningModule):
     def __init__(self, d_model=512, n_heads=4, n_layers=8, lr=1e-4,
-                 gnn_depth=6, max_classes=4):
+                 gnn_depth=6, max_classes=4, training_task="regression"):
         super().__init__()
         self.save_hyperparameters()
 
@@ -128,8 +128,9 @@ class ChemPFN(pl.LightningModule):
         k_idx = torch.randperm(D, device=self.device)[:K]
         y_subset = y[:, :, k_idx]  # (1, N, K)
 
-        if torch.rand(1).item() > 0.5:
-            # --- REGRESSION (averaged) ---
+        task = self.hparams.training_task
+
+        if task == "regression":
             loss = 0.0
             for _ in range(n_accum):
                 y_hyper = _random_mlp_hyperdescriptor(y_subset, H, self.device)
@@ -137,9 +138,7 @@ class ChemPFN(pl.LightningModule):
                 q = query_mask.squeeze(-1)
                 loss += F.mse_loss(preds[q], y_hyper[q])
             loss /= n_accum
-            self.log("train_loss_reg", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=N)
         else:
-            # --- BINARY CLASSIFICATION (averaged) ---
             loss = 0.0
             for _ in range(n_accum):
                 y_hyper = _random_mlp_hyperdescriptor(y_subset, H, self.device)
@@ -150,7 +149,6 @@ class ChemPFN(pl.LightningModule):
                 preds = self(graph, y_cls, query_mask, task="classification")
                 loss += F.cross_entropy(preds[..., :2][q], y_cls[q])
             loss /= n_accum
-            self.log("train_loss_cls", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=N)
 
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=N)
         return loss
