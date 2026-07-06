@@ -8,17 +8,19 @@ from polaris.utils.types import TargetType
 from inference import run_inference, calibrate_threshold
 
 if __name__ == "__main__":
-    try:
-        ckpt_path = sys.argv[1]
-    except IndexError:
-        print("usage: python eval.py /path/to/model.ckpt")
+    if len(sys.argv) < 3:
+        print("usage: python eval.py /path/to/reg_model.ckpt /path/to/cls_model.ckpt")
         exit(1)
+
+    reg_ckpt, cls_ckpt = sys.argv[1], sys.argv[2]
 
     output_file = open("eval_results.md", "w")
     output_file.write(
         f"""# Eval Results
-timestamp: {datetime.datetime.now()}
 
+timestamp: {datetime.datetime.now()}
+reg_checkpoint: {reg_ckpt}
+cls_checkpoint: {cls_ckpt}
 """
     )
     performance_dict = {}
@@ -59,12 +61,14 @@ timestamp: {datetime.datetime.now()}
         train, test = benchmark.get_train_test_split()
         train_df, test_df = train.as_dataframe(), test.as_dataframe()
         task_type = benchmark.target_types[target_cols[0]]
-        outname = benchmark_name.split("/")[1]
 
         train_smiles_list = train_df[smiles_col].to_list()
         train_labels_list = train_df[target_cols[0]].to_list()
 
-        threshold = 0.5  # default for non-classification or fallback
+        # Select checkpoint based on task type
+        ckpt_path = reg_ckpt if task_type == TargetType.REGRESSION else cls_ckpt
+
+        threshold = 0.5
         if task_type == TargetType.CLASSIFICATION:
             threshold, calib_score = calibrate_threshold(
                 ckpt_path,

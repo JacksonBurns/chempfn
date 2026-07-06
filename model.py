@@ -1,130 +1,188 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning.pytorch as pl
-import math
+from chemprop.featurizers import BatchCuikMolGraph
+from chemprop.nn.message_passing import BondMessagePassing
+from chemprop.nn import NormAggregation
+from features import ATOM_FDIM, BOND_FDIM, N_DESC, get_featurizer, FEATURIZER
 
-from features import get_rdkit_features
+featurizer = get_featurizer(FEATURIZER)
+
+
+def _move_graph_to(graph, device):
+    """Move BatchCuikMolGraph fields to device."""
+    for field in ("V", "E", "edge_index", "rev_edge_index", "batch"):
+        v = getattr(graph, field, None)
+        if v is not None:
+            setattr(graph, field, v.to(device))
+    return graph
+
+
+def _random_mlp_hyperdescriptor(y_subset, H, device):
+    """Create a scalar hyperdescriptor from a subset of descriptors via a random MLP.
+
+    Randomly chooses depth in {0, 1, 2}:
+      0: linear (K → 1)
+      1: one hidden (K → H → 1)
+      2: two hidden (K → H → H → 1)
+
+    y_subset: (1, N, K) — selected descriptor columns
+    Returns: (1, N, 1) zero-mean, unit-var scalar
+    """
+    B, N, K = y_subset.shape
+    depth = torch.randint(0, 3, (1,)).item()
+
+    if depth == 0:
+        W = torch.randn(B, K, 1, device=device) / math.sqrt(K)
+        out = torch.bmm(y_subset, W)
+    elif depth == 1:
+        W1 = torch.randn(B, K, H, device=device) / math.sqrt(K)
+        b1 = torch.randn(B, 1, H, device=device) * 0.1
+        h = torch.tanh(torch.bmm(y_subset, W1) + b1)
+        W2 = torch.randn(B, H, 1, device=device) / math.sqrt(H)
+        b2 = torch.randn(B, 1, 1, device=device) * 0.1
+        out = torch.bmm(h, W2) + b2
+    else:
+        W1 = torch.randn(B, K, H, device=device) / math.sqrt(K)
+        b1 = torch.randn(B, 1, H, device=device) * 0.1
+        h = torch.tanh(torch.bmm(y_subset, W1) + b1)
+        W2 = torch.randn(B, H, H, device=device) / math.sqrt(H)
+        b2 = torch.randn(B, 1, H, device=device) * 0.1
+        h = torch.tanh(torch.bmm(h, W2) + b2)
+        W3 = torch.randn(B, H, 1, device=device) / math.sqrt(H)
+        b3 = torch.randn(B, 1, 1, device=device) * 0.1
+        out = torch.bmm(h, W3) + b3
+
+    out = (out - out.mean(dim=1, keepdim=True)) / (out.std(dim=1, keepdim=True) + 1e-6)
+    return out
 
 
 class ChemPFN(pl.LightningModule):
-    def __init__(self, d_in, d_model=512, n_heads=8, n_layers=8, lr=1e-4,
-             hidden_dim=128, max_classes=10):
+    def __init__(self, d_model=512, n_heads=4, n_layers=8, lr=1e-4,
+                 gnn_depth=6, max_classes=4, training_task="regression"):
         super().__init__()
         self.save_hyperparameters()
-        self.register_buffer("X_mean", torch.zeros(d_in))
-        self.register_buffer("X_std", torch.ones(d_in))
 
-        self.x_proj = nn.Linear(d_in, d_model)
+        # Learned GNN: atom/bond → molecular embedding
+        self.gnn = BondMessagePassing(
+            d_v=ATOM_FDIM, d_e=BOND_FDIM, d_h=d_model,
+            depth=gnn_depth, activation="leakyrelu",
+        )
+        self.aggregator = NormAggregation()
+
+        # Regression: single scalar label projection + head
         self.y_proj_reg = nn.Linear(1, d_model)
+        self.head_reg = nn.Linear(d_model, 1)
+
+        # Classification: class embedding + head
         self.y_embed_cls = nn.Embedding(max_classes, d_model)
+        self.head_cls = nn.Linear(d_model, max_classes)
+
         self.query_mask_token = nn.Parameter(torch.randn(d_model) * 0.02)
-        self.task_embed = nn.Embedding(2, d_model)  # 0=regression, 1=classification
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 4,
-            batch_first=True, norm_first=True, activation="gelu"
+            batch_first=True, norm_first=True, activation="gelu",
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.head_reg = nn.Linear(d_model, 1)
-        self.head_cls = nn.Linear(d_model, max_classes)
 
     def forward(self, x, y, query_mask, task="regression"):
-        x_tok = self.x_proj(x)
-        task_idx = torch.tensor(0 if task == "regression" else 1, device=x.device)
-        task_tok = self.task_embed(task_idx).view(1, 1, -1)
+        d_model = self.hparams.d_model
 
-        if task == "regression":
-            y_masked = y.masked_fill(query_mask, 0.0)
-            y_tok = self.y_proj_reg(y_masked)
+        if isinstance(x, BatchCuikMolGraph):
+            n_mol = len(x.batch.unique())
+            x_tok = self.aggregator(self.gnn(x), x.batch).view(1, n_mol, d_model)
         else:
-            # y is (B, N) long class indices; query_mask is (B, N, 1) bool
-            y_tok = self.y_embed_cls(y.clamp(min=0))
-            mask_tok = self.query_mask_token.view(1, 1, -1).expand_as(y_tok)
-            y_tok = torch.where(query_mask, mask_tok, y_tok)
-
-        tokens = x_tok + y_tok + task_tok
-        out = self.transformer(tokens)
-        return self.head_reg(out) if task == "regression" else self.head_cls(out)
-        
-    def generate_synthetic_prior(self, x, task):
-        B, N, D = x.shape
-        H = self.hparams.hidden_dim
-        device = self.device
-
-        depth = torch.randint(1, 4, (1,)).item()
-        activations = [F.relu, torch.tanh, F.gelu]
-        act = activations[torch.randint(0, len(activations), (1,)).item()]
-
-        h, in_dim = x, D
-        for _ in range(depth):
-            W = torch.randn(B, in_dim, H, device=device) / math.sqrt(in_dim)
-            b = torch.randn(B, 1, H, device=device) * 0.1
-            h = act(torch.bmm(h, W) + b)
-            in_dim = H
-        W_out = torch.randn(B, in_dim, 1, device=device) / math.sqrt(in_dim)
-        raw = torch.bmm(h, W_out)
-        raw = raw + torch.randn_like(raw) * (torch.rand(B, 1, 1, device=device) * 0.1)
+            x_tok = x
 
         if task == "regression":
-            targets = (raw - raw.mean(1, keepdim=True)) / (raw.std(1, keepdim=True) + 1e-6)
-            return targets  # (B, N, 1) float
+            y_tok = self.y_proj_reg(y)
+        else:
+            y_tok = self.y_embed_cls(y.clamp(min=0))
 
-        n_classes = torch.randint(2, self.hparams.max_classes + 1, (1,)).item()
-        qs = torch.linspace(0, 1, n_classes + 1, device=device)[1:-1]
-        edges = torch.quantile(raw.squeeze(-1), qs, dim=1).transpose(0, 1)  # (B, n_classes-1)
-        labels = torch.zeros(B, N, dtype=torch.long, device=device)
-        for c in range(n_classes - 1):
-            labels += (raw.squeeze(-1) > edges[:, c:c + 1]).long()
-        return labels, n_classes  # (B, N) long, and class count used this step
+        mask_tok = self.query_mask_token.view(1, 1, -1).expand_as(y_tok)
+        y_tok = torch.where(query_mask, mask_tok, y_tok)
+
+        tokens = x_tok + y_tok
+        q = query_mask.squeeze(-1)
+        out = self.transformer(tokens, src_key_padding_mask=q)
+
+        if task == "regression":
+            return self.head_reg(out)
+        return self.head_cls(out)
 
     def training_step(self, batch, batch_idx):
-        x_batch = batch
-        B, N, _ = x_batch.shape
-        task = "classification" if torch.rand(1).item() > 0.5 else "regression"
+        graph, y = batch
+        graph = _move_graph_to(graph, self.device)
+        y = y.to(self.device).unsqueeze(0)  # (1, N, N_DESC)
+
+        B, N, D = 1, y.shape[1], y.shape[2]
         query_mask = torch.rand(B, N, 1, device=self.device) > 0.5
 
-        if task == "regression":
-            y_batch = self.generate_synthetic_prior(x_batch, task="regression")
-            preds = self(x_batch, y_batch, query_mask, task="regression")
-            loss = F.mse_loss(preds[query_mask], y_batch[query_mask])
-        else:
-            y_batch, n_classes = self.generate_synthetic_prior(x_batch, task="classification")
-            qmask2d = query_mask.squeeze(-1)
-            preds = self(x_batch, y_batch, query_mask, task="classification")
-            loss = F.cross_entropy(preds[..., :n_classes][qmask2d], y_batch[qmask2d])
+        # Average over multiple random hyperdescriptors to reduce variance
+        n_accum = 4
+        H = 32
+        K = torch.randint(max(5, D // 20), max(10, D // 2), (1,)).item()
+        k_idx = torch.randperm(D, device=self.device)[:K]
+        y_subset = y[:, :, k_idx]  # (1, N, K)
 
-        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        self.log(f"train_loss_{task}", loss, on_step=True, on_epoch=True)
+        task = self.hparams.training_task
+
+        if task == "regression":
+            loss = 0.0
+            for _ in range(n_accum):
+                y_hyper = _random_mlp_hyperdescriptor(y_subset, H, self.device)
+                preds = self(graph, y_hyper, query_mask, task="regression")
+                q = query_mask.squeeze(-1)
+                loss += F.mse_loss(preds[q], y_hyper[q])
+            loss /= n_accum
+        else:
+            loss = 0.0
+            for _ in range(n_accum):
+                y_hyper = _random_mlp_hyperdescriptor(y_subset, H, self.device)
+                q = query_mask.squeeze(-1)
+                context_vals = y_hyper[~q, 0]
+                median = context_vals.median() if context_vals.numel() > 1 else context_vals.mean()
+                y_cls = (y_hyper[:, :, 0] >= median).long()
+                preds = self(graph, y_cls, query_mask, task="classification")
+                loss += F.cross_entropy(preds[..., :2][q], y_cls[q])
+            loss /= n_accum
+
+        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=N)
         return loss
-    
+
     def predict_step(self, batch, batch_idx, dataloader_idx=0, task="regression",
-                  n_classes=None, max_context=512, n_ensemble=4):
+                     n_classes=None, max_context=512, n_ensemble=4):
         train_smiles, train_labels, test_smiles = batch
 
         if task == "regression":
             labels_raw = torch.tensor(train_labels, dtype=torch.float32, device=self.device)
             y_mean, y_std = labels_raw.mean(), labels_raw.std() + 1e-6
-            labels_proc = (labels_raw - y_mean) / y_std
+            labels_proc = ((labels_raw - y_mean) / y_std).unsqueeze(-1)
         else:
-            assert n_classes is not None, "pass n_classes for classification (e.g. len(set(train_labels)))"
+            assert n_classes is not None, "pass n_classes for classification"
             labels_proc = torch.tensor(train_labels, dtype=torch.long, device=self.device)
 
         all_smiles = list(train_smiles) + list(test_smiles)
-        X_raw = torch.tensor(get_rdkit_features(all_smiles), dtype=torch.float32, device=self.device)
-        X = (X_raw - self.X_mean) / self.X_std
-        n_train = len(train_labels)
-        X_train, X_test = X[:n_train], X[n_train:]
-        n_test = X_test.shape[0]
-        test_budget = max(max_context - min(n_train, max_context), 1)
+        graph = featurizer(all_smiles)
+        graph = _move_graph_to(graph, self.device)
 
+        d_model = self.hparams.d_model
+        all_x = self.aggregator(self.gnn(graph), graph.batch).view(1, -1, d_model)
+
+        n_train = len(train_labels)
+        n_test = len(test_smiles)
+        train_x, test_x = all_x[:, :n_train], all_x[:, n_train:]
+        test_budget = max(max_context - min(n_train, max_context), 1)
         out_dim = 1 if task == "regression" else n_classes
         preds_sum = torch.zeros(n_test, out_dim, device=self.device)
 
         for chunk_start in range(0, n_test, test_budget):
             chunk_end = min(chunk_start + test_budget, n_test)
-            X_chunk = X_test[chunk_start:chunk_end]
-            chunk_size = X_chunk.shape[0]
+            X_chunk = test_x[:, chunk_start:chunk_end]
+            chunk_size = X_chunk.shape[1]
             passes = n_ensemble if n_train > max_context - chunk_size else 1
             chunk_preds = torch.zeros(chunk_size, out_dim, device=self.device)
 
@@ -135,14 +193,14 @@ class ChemPFN(pl.LightningModule):
                 else:
                     idx = torch.arange(n_train, device=self.device)
 
-                X_combined = torch.cat([X_train[idx], X_chunk], dim=0).unsqueeze(0)
+                X_combined = torch.cat([train_x[:, idx], X_chunk], dim=1)
                 total_len = X_combined.shape[1]
                 mask = torch.zeros(1, total_len, 1, dtype=torch.bool, device=self.device)
                 mask[0, len(idx):, 0] = True
 
                 if task == "regression":
                     y_combined = torch.zeros(1, total_len, 1, device=self.device)
-                    y_combined[0, :len(idx), 0] = labels_proc[idx]
+                    y_combined[0, :len(idx), 0] = labels_proc[idx].squeeze(-1)
                     out = self(X_combined, y_combined, mask, task="regression")[mask].view(-1, 1)
                 else:
                     y_combined = torch.zeros(1, total_len, dtype=torch.long, device=self.device)
@@ -156,7 +214,7 @@ class ChemPFN(pl.LightningModule):
 
         if task == "regression":
             return preds_sum * y_std + y_mean
-        return preds_sum  # class probabilities, shape (n_test, n_classes)
+        return preds_sum
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
