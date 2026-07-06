@@ -81,25 +81,29 @@ class ChemPFN(pl.LightningModule):
         self.chemeleon_encoder.load_state_dict(chemeleon_mp["state_dict"])
         self.chemeleon_agg = cp_nn.MeanAggregation()
 
+        assert d_model > 256, "d_model must be greater than 256 to accommodate projection head and regression/classification head"
+
         for param in self.chemeleon_encoder.parameters():
             param.requires_grad = False
 
-        # Projection head to reduce to d_model
-        self.x_proj = nn.Linear(self.chemeleon_encoder.output_dim, d_model)
+        # 128 for the regression/classification head, rest for the embedding
+
+        # Projection head to reduce to d_model - 128
+        self.x_proj = nn.Linear(self.chemeleon_encoder.output_dim, d_model - 128)
 
         # Regression: single scalar label projection + head
-        self.y_proj_reg = nn.Linear(1, d_model)
-        self.head_reg = nn.Linear(d_model * 2, 1)
+        self.y_proj_reg = nn.Linear(1, 128)
+        self.head_reg = nn.Linear(128, 1)
 
         # Classification: class embedding + head
-        self.y_embed_cls = nn.Embedding(max_classes, d_model)
-        self.head_cls = nn.Linear(d_model * 2, max_classes)
+        self.y_embed_cls = nn.Embedding(max_classes, 128)
+        self.head_cls = nn.Linear(128, max_classes)
 
         self.query_mask_token = nn.Parameter(torch.randn(d_model) * 0.02)
 
-        # Transformer expects d_model * 2 due to concatenation
+        # Transformer expects d_model
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model * 2, nhead=n_heads, dim_feedforward=d_model * 8,
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 4,
             batch_first=True, norm_first=True, activation="gelu",
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
