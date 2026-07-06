@@ -23,16 +23,7 @@ def _move_graph_to(graph, device):
 
 
 def _random_mlp_hyperdescriptor(y_subset, H, device):
-    """Create a scalar hyperdescriptor from a subset of descriptors via a random MLP.
-
-    Randomly chooses depth in {0, 1, 2}:
-      0: linear (K → 1)
-      1: one hidden (K → H → 1)
-      2: two hidden (K → H → H → 1)
-
-    y_subset: (1, N, K) — selected descriptor columns
-    Returns: (1, N, 1) zero-mean, unit-var scalar
-    """
+    """Create a scalar hyperdescriptor from a subset of descriptors via a random MLP."""
     B, N, K = y_subset.shape
     depth = torch.randint(0, 3, (1,)).item()
 
@@ -86,22 +77,23 @@ class ChemPFN(pl.LightningModule):
         for param in self.chemeleon_encoder.parameters():
             param.requires_grad = False
 
-        # 128 for the regression/classification head, rest for the embedding
-
         # Projection head to reduce to d_model - 128
         self.x_proj = nn.Linear(self.chemeleon_encoder.output_dim, d_model - 128)
 
-        # Regression: single scalar label projection + head
+        # Regression: single scalar label projection
         self.y_proj_reg = nn.Linear(1, 128)
-        self.head_reg = nn.Linear(128, 1)
+        # Head takes the fully concatenated output from the transformer (d_model)
+        self.head_reg = nn.Linear(d_model, 1)
 
-        # Classification: class embedding + head
+        # Classification: class embedding
         self.y_embed_cls = nn.Embedding(max_classes, 128)
-        self.head_cls = nn.Linear(128, max_classes)
+        # Head takes the fully concatenated output from the transformer (d_model)
+        self.head_cls = nn.Linear(d_model, max_classes)
 
-        self.query_mask_token = nn.Parameter(torch.randn(d_model) * 0.02)
+        # Mask token must match the embedding size of y_tok
+        self.query_mask_token = nn.Parameter(torch.randn(128) * 0.02)
 
-        # Transformer expects d_model
+        # Transformer expects exactly d_model
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 4,
             batch_first=True, norm_first=True, activation="gelu",
@@ -129,7 +121,7 @@ class ChemPFN(pl.LightningModule):
         mask_tok = self.query_mask_token.view(1, 1, -1).expand_as(y_tok)
         y_tok = torch.where(query_mask, mask_tok, y_tok)
 
-        # Concatenate X_tok and y_tok rather than summing
+        # Concatenate X_tok (d_model - 128) and y_tok (128) rather than summing -> d_model
         tokens = torch.cat([x_tok, y_tok], dim=-1)
         q = query_mask.squeeze(-1)
         
