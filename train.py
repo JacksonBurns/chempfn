@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import torch
@@ -54,13 +55,20 @@ def run_training(smiles_list, max_epochs=512):
         collate_fn=make_collate_fn(smiles_list, desc_tensor),
     )
 
-    model = ChemPFN()
+    if (ckpt := Path(os.environ.get("INIT_FROM_CHECKPOINT"))).exists():
+        print(f"Initializing model from checkpoint: {ckpt}")
+        model = ChemPFN.load_from_checkpoint(ckpt)
+        # override learning rate
+        model.hparams.lr = 1e-5
+    else:
+        print("Initializing new model (set INIT_FROM_CHECKPOINT to initialize from checkpoint)...")
+        model = ChemPFN()
 
     logger = TensorBoardLogger(save_dir="logs/", default_hp_metric=False)
 
     early_stop_callback = EarlyStopping(
         monitor="train_loss_epoch",
-        patience=10,
+        patience=20,
         mode="min",
         check_on_train_epoch_end=True,
     )
