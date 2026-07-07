@@ -157,7 +157,7 @@ def run_training(smiles_list, max_epochs=512, training_task="regression", init_f
         ],
         default_root_dir=logger.log_dir,
         # use bfloat16 precision for faster training and lower memory usage
-        precision="bf16-mixed",
+        precision="bf16",
     )
 
     trainer.fit(model, dataloader)

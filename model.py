@@ -103,13 +103,11 @@ class ChemPFN(pl.LightningModule):
 
     def forward(self, x, y, query_mask, task="regression"):
         if not isinstance(x, torch.Tensor):
-            # Process raw BatchCuikMolGraph through frozen encoder
             with torch.no_grad():
                 self.chemeleon_encoder.eval()
                 x_chemeleon = self.chemeleon_agg(self.chemeleon_encoder(x), x.batch)
             x_chemeleon = x_chemeleon.view(1, -1, self.chemeleon_encoder.output_dim)
         else:
-            # Bypass if already encoded (used heavily in predict_step chunks)
             x_chemeleon = x
 
         x_tok = self.x_proj(x_chemeleon)
@@ -119,11 +117,9 @@ class ChemPFN(pl.LightningModule):
         else:
             y_tok = self.y_embed_cls(y.clamp(min=0))
 
-        # Extract the weight from the embedding module to use as the token
         mask_tok = self.query_mask_token.weight.view(1, 1, -1).expand_as(y_tok)
         y_tok = torch.where(query_mask, mask_tok, y_tok)
 
-        # Concatenate X_tok (d_model - d_task) and y_tok (d_task) rather than summing -> d_model
         tokens = torch.cat([x_tok, y_tok], dim=-1)
         q = query_mask.squeeze(-1)
         
@@ -137,19 +133,21 @@ class ChemPFN(pl.LightningModule):
         graph = batch[0]
         graph = _move_graph_to(graph, self.device)
 
-        # Generate frozen base embeddings for the batch
         with torch.no_grad():
             self.chemeleon_encoder.eval()
             x_chemeleon = self.chemeleon_agg(self.chemeleon_encoder(graph), graph.batch)
         x_chemeleon = x_chemeleon.view(1, -1, self.chemeleon_encoder.output_dim)
 
         B, N, D = 1, x_chemeleon.shape[1], x_chemeleon.shape[2]
-        query_mask = torch.rand(B, N, 1, device=self.device) > 0.5
+        
+        # Dynamic Masking Ratio (10% to 90%)
+        # This decouples the model from a fixed 1:1 context/query split
+        mask_prob = torch.rand(1, device=self.device).item() * 0.8 + 0.1
+        query_mask = torch.rand(B, N, 1, device=self.device) > mask_prob
 
         n_accum = 10
         H = 32
         
-        # Draw random subset of features from CheMeleon embeddings for synthetic task
         K = torch.randint(max(5, D // 20), max(10, D // 2), (1,)).item()
         k_idx = torch.randperm(D, device=self.device)[:K]
         y_subset = x_chemeleon[:, :, k_idx]
@@ -185,13 +183,14 @@ class ChemPFN(pl.LightningModule):
 
         if task == "regression":
             labels_raw = torch.tensor(train_labels, dtype=torch.float32, device=self.device)
-            y_mean, y_std = labels_raw.mean(), labels_raw.std() + 1e-6
+            y_mean = labels_raw.mean()
+            # Added unbiased=False to prevent NaN standard deviation on 1-shot inputs
+            y_std = labels_raw.std(unbiased=False) + 1e-6
             labels_proc = ((labels_raw - y_mean) / y_std).unsqueeze(-1)
         else:
             assert n_classes is not None, "pass n_classes for classification"
             labels_proc = torch.tensor(train_labels, dtype=torch.long, device=self.device)
 
-        # Pass the SMILES strings directly into the featurizer all at once
         all_smiles = list(train_smiles) + list(test_smiles)
         graph = featurizer(all_smiles)
         graph = _move_graph_to(graph, self.device)
@@ -203,7 +202,14 @@ class ChemPFN(pl.LightningModule):
         n_train = len(train_labels)
         n_test = len(test_smiles)
         train_x, test_x = all_chemeleon[:, :n_train], all_chemeleon[:, n_train:]
-        test_budget = max(max_context - min(n_train, max_context), 1)
+        
+        # Ensure we always reserve space for test queries to maintain GPU throughput
+        min_test_budget = min(512, n_test, max(1, max_context // 4))
+        
+        # Maximize context while leaving room for the guaranteed test budget
+        ctx_n = min(n_train, max_context - min_test_budget)
+        test_budget = max_context - ctx_n 
+        
         out_dim = 1 if task == "regression" else n_classes
         preds_sum = torch.zeros(n_test, out_dim, device=self.device)
 
@@ -211,13 +217,19 @@ class ChemPFN(pl.LightningModule):
             chunk_end = min(chunk_start + test_budget, n_test)
             X_chunk = test_x[:, chunk_start:chunk_end]
             chunk_size = X_chunk.shape[1]
-            passes = n_ensemble if n_train > max_context - chunk_size else 1
+            passes = n_ensemble if n_train > ctx_n else 1
             chunk_preds = torch.zeros(chunk_size, out_dim, device=self.device)
 
             for _ in range(passes):
-                if n_train > max_context - chunk_size:
-                    ctx_n = max_context - chunk_size
-                    idx = torch.randperm(n_train, device=self.device)[:ctx_n]
+                if n_train > ctx_n:
+                    # Cosine Similarity Context Retrieval (Fast MMD Proxy)
+                    # Get the centroid of the current test chunk
+                    chunk_mean = X_chunk.squeeze(0).mean(dim=0, keepdim=True) # [1, D]
+                    train_flat = train_x.squeeze(0) # [n_train, D]
+                    
+                    # Compute similarity and retrieve the top-K matching contexts
+                    sim = F.cosine_similarity(train_flat, chunk_mean, dim=-1)
+                    _, idx = torch.topk(sim, ctx_n)
                 else:
                     idx = torch.arange(n_train, device=self.device)
 
@@ -245,5 +257,4 @@ class ChemPFN(pl.LightningModule):
         return preds_sum
 
     def configure_optimizers(self):
-        # Exclude frozen encoder parameters from the optimizer
         return torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.hparams.lr)
