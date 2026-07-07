@@ -17,7 +17,7 @@ from model import featurizer
 from lightning.pytorch.callbacks import Callback
 
 class ContextWindowCurriculum(Callback):
-    def __init__(self, collate_fn, warmup_epochs=256, start_max_n=128, end_max_n=1024):
+    def __init__(self, collate_fn, warmup_epochs=256, start_max_n=128, end_max_n=4096):
         self.collate_fn = collate_fn
         self.warmup_epochs = warmup_epochs
         self.start_max_n = start_max_n
@@ -71,7 +71,7 @@ class SmilesDataset(Dataset):
 
 
 class CurriculumCollate:
-    def __init__(self, smiles_list, min_n=64, start_max_n=128, end_max_n=1024):
+    def __init__(self, smiles_list, min_n=64, start_max_n=128, end_max_n=4096):
         self.smiles_list = smiles_list
         self.min_n = min_n
         self.current_max_n = start_max_n
@@ -98,13 +98,13 @@ def run_training(smiles_list, max_epochs=512, training_task="regression", init_f
         smiles_list, 
         min_n=64, 
         start_max_n=128,  # Start with a smaller ceiling 
-        end_max_n=1024    # Grow to your target ceiling
+        end_max_n=4096,    # Grow to your target ceiling
     )
     
     dataloader = DataLoader(
         dataset,
         batch_size=32,
-        num_workers=2,
+        num_workers=1,
         shuffle=True,
         collate_fn=collate_fn, # 2. Use it here
     )
@@ -141,7 +141,7 @@ def run_training(smiles_list, max_epochs=512, training_task="regression", init_f
         collate_fn=collate_fn, 
         warmup_epochs=max_epochs // 2, 
         start_max_n=128, 
-        end_max_n=1024
+        end_max_n=4096,
     )
 
     trainer = pl.Trainer(
@@ -153,7 +153,7 @@ def run_training(smiles_list, max_epochs=512, training_task="regression", init_f
         callbacks=[
             early_stop_callback, 
             model_checkpoint_callback, 
-            curriculum_callback # 4. Add it to the Trainer
+            curriculum_callback, # 4. Add it to the Trainer
         ],
         default_root_dir=logger.log_dir,
         # use bfloat16 precision for faster training and lower memory usage
@@ -170,8 +170,23 @@ if __name__ == "__main__":
     torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
     torch.set_float32_matmul_precision('medium')
     pl.seed_everything(42)
-    with open("cleaned_pubchem_1MM.smiles", "r") as file:
-        smiles = [line.strip() for line in file.readlines()]
+
+    import sys
+
+    try:
+        smiles_file = sys.argv[1]
+    except:
+        print("Usage: python train.py /path/to/smiles.parquet")
+        sys.exit(1)
+
+    import polars
+
+    smiles = polars.read_parquet(smiles_file)["SMILES"].to_list()
+
+    from rdkit.rdBase import BlockLogs
+
+    # shh!
+    bl = BlockLogs()
 
     # Phase 1: Regression pre-training from scratch
     reg_ckpt = run_training(smiles, max_epochs=512, training_task="regression")
