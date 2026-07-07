@@ -1,3 +1,4 @@
+# python 3.12
 polaris-lib
 tabulate
 lightning
