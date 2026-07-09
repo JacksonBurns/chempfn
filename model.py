@@ -184,7 +184,6 @@ class ChemPFN(pl.LightningModule):
         if task == "regression":
             labels_raw = torch.tensor(train_labels, dtype=torch.float32, device=self.device)
             y_mean = labels_raw.mean()
-            # Added unbiased=False to prevent NaN standard deviation on 1-shot inputs
             y_std = labels_raw.std(unbiased=False) + 1e-6
             labels_proc = ((labels_raw - y_mean) / y_std).unsqueeze(-1)
         else:
@@ -220,16 +219,37 @@ class ChemPFN(pl.LightningModule):
             passes = n_ensemble if n_train > ctx_n else 1
             chunk_preds = torch.zeros(chunk_size, out_dim, device=self.device)
 
+            # Pre-compute relevance for the entire chunk BEFORE the ensemble loop
+            if n_train > ctx_n:
+                train_flat = train_x.squeeze(0)  # [n_train, D]
+                chunk_flat = X_chunk.squeeze(0)  # [chunk_size, D]
+                
+                # Normalize for Cosine Similarity
+                train_norm = F.normalize(train_flat, p=2, dim=-1)
+                chunk_norm = F.normalize(chunk_flat, p=2, dim=-1)
+                
+                # Pairwise similarity matrix: [n_train, chunk_size]
+                sim_matrix = torch.matmul(train_norm, chunk_norm.transpose(0, 1))
+                
+                # Max similarity to ANY molecule in the test chunk
+                relevance, _ = sim_matrix.max(dim=1)  # [n_train]
+
             for _ in range(passes):
                 if n_train > ctx_n:
-                    # Cosine Similarity Context Retrieval (Fast MMD Proxy)
-                    # Get the centroid of the current test chunk
-                    chunk_mean = X_chunk.squeeze(0).mean(dim=0, keepdim=True) # [1, D]
-                    train_flat = train_x.squeeze(0) # [n_train, D]
-                    
-                    # Compute similarity and retrieve the top-K matching contexts
-                    sim = F.cosine_similarity(train_flat, chunk_mean, dim=-1)
-                    _, idx = torch.topk(sim, ctx_n)
+                    if passes == 1:
+                        # Deterministic retrieval for single-pass speed
+                        _, idx = torch.topk(relevance, ctx_n)
+                    else:
+                        # Gumbel-Top-K for Stochastic Ensemble Diversity
+                        # Temperature controls randomness (lower = closer to strict top-K)
+                        temperature = 0.05
+                        # Generate Gumbel noise
+                        u = torch.rand_like(relevance) + 1e-10
+                        gumbel_noise = -torch.log(-torch.log(u))
+                        
+                        # Add noise to scaled relevance and extract
+                        noisy_relevance = (relevance / temperature) + gumbel_noise
+                        _, idx = torch.topk(noisy_relevance, ctx_n)
                 else:
                     idx = torch.arange(n_train, device=self.device)
 

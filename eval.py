@@ -2,17 +2,32 @@ import datetime
 import json
 import sys
 
+import pandas as pd
 import polaris as po
 from polaris.utils.types import TargetType
 
 from inference import run_inference, calibrate_threshold
 
+def get_leaderboard_snippet(benchmark_name, current_perf, leaderboard_df, metric):
+    """Filters the leaderboard for a specific benchmark and appends the new model."""
+    subset = leaderboard_df[leaderboard_df['Benchmark_ID'] == benchmark_name].copy()
+    # Add your model as a new row
+    new_entry = {'Name': 'ChemPFN', metric: current_perf}
+    # Append and sort by score
+    lower_is_better = False
+    if metric in {'mean_absolute_error', 'mean_squared_error'}:
+        lower_is_better = True
+    return pd.concat([subset, pd.DataFrame([new_entry])], ignore_index=True).sort_values(by=metric, ascending=lower_is_better).reset_index(drop=True)
+
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("usage: python eval.py /path/to/reg_model.ckpt /path/to/cls_model.ckpt")
+    if len(sys.argv) < 4:
+        print("usage: python eval.py /path/to/reg_model.ckpt /path/to/cls_model.ckpt /path/to/leaderboard.csv")
         exit(1)
 
     reg_ckpt, cls_ckpt = sys.argv[1], sys.argv[2]
+    leaderboard_path = sys.argv[3]
+
+    leaderboard_df = pd.read_csv(leaderboard_path)
 
     output_file = open("eval_results.md", "w")
     output_file.write(
@@ -24,6 +39,7 @@ cls_checkpoint: {cls_ckpt}
 """
     )
     performance_dict = {}
+    ranks = []
     polaris_benchmarks = (
         "polaris/pkis2-ret-wt-cls-v2",
         "polaris/pkis2-ret-wt-reg-v2",
@@ -100,17 +116,27 @@ cls_checkpoint: {cls_ckpt}
                 f"Metric == '{benchmark.main_metric.label}'"
             )["Score"].values[0]
 
+        lb_snippet = get_leaderboard_snippet(benchmark_name, performance, leaderboard_df, benchmark.main_metric.label)
+        if lb_snippet.shape[0] >= 5:
+            ranks.append(lb_snippet.query("Name == 'ChemPFN'").index[0] + 1)  # +1 for 1-based rank
+
         output_file.write(
             f"""
-## `{benchmark_name}`{f"\n\ncalibrated threshold: {threshold:.2f}\n" if task_type == TargetType.CLASSIFICATION else "\n"}
+## `{benchmark_name}`
+
+### Model Performance
 {results.to_markdown()}
+
+### Leaderboard Comparison
+{lb_snippet[['Name', benchmark.main_metric.label]].to_markdown(index=False)}
 """
         )
         performance_dict[benchmark_name] = {benchmark.main_metric.label: performance}
-
     output_file.write(
         f"""
 # Summary
+
+Average Rank of ChemPFN across benchmarks with 4+ other entries {len(ranks)}: {sum(ranks) / len(ranks):.2f}
 
 results_dict = {json.dumps(performance_dict, indent=4)}
 """
