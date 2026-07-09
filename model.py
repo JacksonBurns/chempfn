@@ -49,12 +49,35 @@ def _random_mlp_hyperdescriptor(y_subset, H, device):
         out = torch.bmm(h, W3) + b3
 
     out = (out - out.mean(dim=1, keepdim=True)) / (out.std(dim=1, keepdim=True) + 1e-6)
+    
+    # Inject SAFE noise to simulate experimental error (still crucial for discretization!)
+    if torch.rand(1).item() > 0.3:
+        base_noise = torch.randn_like(out) * 0.1
+        outlier_mask = (torch.rand_like(out) > 0.95).float()
+        outlier_noise = (torch.rand_like(out) * 6.0 - 3.0) * outlier_mask 
+        out = out + base_noise + outlier_noise
+        out = (out - out.mean(dim=1, keepdim=True)) / (out.std(dim=1, keepdim=True) + 1e-6)
+
+    # --- SHAPE AUGMENTATION FOR DISCRETIZER ---
+    dist_choice = torch.rand(1).item()
+
+    if dist_choice < 0.30:
+        # Log-Normal (Skewed Right): Teaches the model to predict skewed probability curves 
+        # massed in the lower bins with a long tail (e.g., raw clearance, IC50)
+        out = torch.exp(out * 1.5)
+        
+    elif dist_choice < 0.50:
+        # Sigmoidal (Bimodal/Bounded): Teaches the model to predict probability mass 
+        # at the extreme edge bins (e.g., percentages like RPPB/HPPB or cliff-edges)
+        out = torch.sigmoid(out * 2.0)
+        
+    # The remaining 50% stays as Standard Normal (Gaussian)
     return out
 
 
 class ChemPFN(pl.LightningModule):
     def __init__(self, d_model=512, n_heads=4, n_layers=8, lr=1e-4,
-                 max_classes=4, training_task="regression", d_task=32):
+                 max_classes=4, training_task="regression", d_task=32, num_bins=100):
         super().__init__()
         self.save_hyperparameters()
 
@@ -80,14 +103,12 @@ class ChemPFN(pl.LightningModule):
         # Projection head to reduce to d_model - d_task
         self.x_proj = nn.Linear(self.chemeleon_encoder.output_dim, d_model - d_task)
 
-        # Regression: single scalar label projection
-        self.y_proj_reg = nn.Linear(1, d_task)
-        # Head takes the fully concatenated output from the transformer (d_model)
-        self.head_reg = nn.Linear(d_model, 1)
+        # Regression is now Discretized: Embedding + Multi-Class Head
+        self.y_embed_reg = nn.Embedding(num_bins, d_task)
+        self.head_reg = nn.Linear(d_model, num_bins)
 
         # Classification: class embedding
         self.y_embed_cls = nn.Embedding(max_classes, d_task)
-        # Head takes the fully concatenated output from the transformer (d_model)
         self.head_cls = nn.Linear(d_model, max_classes)
 
         # Use nn.Embedding so it registers as a distinct module in the PyTorch Lightning summary
@@ -113,7 +134,8 @@ class ChemPFN(pl.LightningModule):
         x_tok = self.x_proj(x_chemeleon)
 
         if task == "regression":
-            y_tok = self.y_proj_reg(y)
+            # Map binned target indices to embeddings
+            y_tok = self.y_embed_reg(y.clamp(min=0, max=self.hparams.num_bins - 1))
         else:
             y_tok = self.y_embed_cls(y.clamp(min=0))
 
@@ -141,39 +163,77 @@ class ChemPFN(pl.LightningModule):
         B, N, D = 1, x_chemeleon.shape[1], x_chemeleon.shape[2]
         
         # Dynamic Masking Ratio (10% to 90%)
-        # This decouples the model from a fixed 1:1 context/query split
         mask_prob = torch.rand(1, device=self.device).item() * 0.8 + 0.1
         query_mask = torch.rand(B, N, 1, device=self.device) > mask_prob
 
         n_accum = 10
         H = 32
         
-        K = torch.randint(max(5, D // 20), max(10, D // 2), (1,)).item()
+        # --- 1. FEATURE SUB-SAMPLING ---
+        if torch.rand(1).item() < 0.25:
+            K = torch.randint(1, 4, (1,)).item()
+        else:
+            K = torch.randint(max(5, D // 20), max(10, D // 2), (1,)).item()
+            
         k_idx = torch.randperm(D, device=self.device)[:K]
         y_subset = x_chemeleon[:, :, k_idx]
 
         task = self.hparams.training_task
 
         if task == "regression":
+            num_bins = self.hparams.num_bins
             loss = 0.0
             for _ in range(n_accum):
                 y_hyper = _random_mlp_hyperdescriptor(y_subset, H, self.device)
-                preds = self(x_chemeleon, y_hyper, query_mask, task="regression")
                 q = query_mask.squeeze(-1)
-                loss += F.mse_loss(preds[q], y_hyper[q])
+                
+                # Dynamic Binning: Calculate range exclusively from the context window
+                context_vals = y_hyper[~q]
+                if context_vals.numel() > 1:
+                    y_min, y_max = context_vals.min(), context_vals.max()
+                else:
+                    y_min, y_max = y_hyper.min(), y_hyper.max()
+
+                # Pad slightly to ensure boundary values fall safely within bins
+                padding = (y_max - y_min) * 0.05 + 1e-6
+                y_min -= padding
+                y_max += padding
+
+                bin_edges = torch.linspace(y_min.item(), y_max.item(), num_bins + 1, device=self.device)
+                
+                # Convert continuous targets to discrete bin classes (0 to num_bins - 1)
+                y_binned = torch.bucketize(y_hyper.squeeze(-1), bin_edges) - 1
+                y_binned = torch.clamp(y_binned, 0, num_bins - 1)
+
+                preds = self(x_chemeleon, y_binned, query_mask, task="regression")
+                # Now trained using standard CrossEntropy Loss!
+                loss += F.cross_entropy(preds[q], y_binned[q])
             loss /= n_accum
+            
         else:
             loss = 0.0
             for _ in range(n_accum):
                 y_hyper = _random_mlp_hyperdescriptor(y_subset, H, self.device)
                 q = query_mask.squeeze(-1)
                 context_vals = y_hyper[~q, 0]
-                median = context_vals.median() if context_vals.numel() > 1 else context_vals.mean()
-                y_cls = (y_hyper[:, :, 0] >= median).long()
+                
+                # --- 2. BREAKING THE 50/50 CLASS BALANCE ---
+                percentile = torch.empty(1, device=self.device).uniform_(0.1, 0.9).item()
+                if context_vals.numel() > 1:
+                    threshold = torch.quantile(context_vals, percentile)
+                else:
+                    threshold = context_vals.mean()
+                    
+                y_cls = (y_hyper[:, :, 0] >= threshold).long()
+                
+                # --- 3. INJECT ASYMMETRIC ASSAY NOISE ---
+                flip_mask = torch.rand_like(y_cls.float()) < 0.03
+                y_cls = torch.where(flip_mask, 1 - y_cls, y_cls)
+
                 preds = self(x_chemeleon, y_cls, query_mask, task="classification")
                 loss += F.cross_entropy(preds[..., :2][q], y_cls[q])
             loss /= n_accum
-
+            
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True, batch_size=N)
         return loss
 
@@ -182,10 +242,21 @@ class ChemPFN(pl.LightningModule):
         train_smiles, train_labels, test_smiles = batch
 
         if task == "regression":
+            num_bins = self.hparams.num_bins
             labels_raw = torch.tensor(train_labels, dtype=torch.float32, device=self.device)
-            y_mean = labels_raw.mean()
-            y_std = labels_raw.std(unbiased=False) + 1e-6
-            labels_proc = ((labels_raw - y_mean) / y_std).unsqueeze(-1)
+            
+            # Dynamic binning based on the specific dataset's scale
+            y_min, y_max = labels_raw.min(), labels_raw.max()
+            padding = (y_max - y_min) * 0.05 + 1e-6
+            y_min -= padding
+            y_max += padding
+
+            bin_edges = torch.linspace(y_min.item(), y_max.item(), num_bins + 1, device=self.device)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+            
+            # Map dataset targets to bin indices for context
+            labels_binned = torch.bucketize(labels_raw, bin_edges) - 1
+            labels_proc = torch.clamp(labels_binned, 0, num_bins - 1)
         else:
             assert n_classes is not None, "pass n_classes for classification"
             labels_proc = torch.tensor(train_labels, dtype=torch.long, device=self.device)
@@ -202,10 +273,7 @@ class ChemPFN(pl.LightningModule):
         n_test = len(test_smiles)
         train_x, test_x = all_chemeleon[:, :n_train], all_chemeleon[:, n_train:]
         
-        # Ensure we always reserve space for test queries to maintain GPU throughput
         min_test_budget = min(512, n_test, max(1, max_context // 4))
-        
-        # Maximize context while leaving room for the guaranteed test budget
         ctx_n = min(n_train, max_context - min_test_budget)
         test_budget = max_context - ctx_n 
         
@@ -259,9 +327,15 @@ class ChemPFN(pl.LightningModule):
                 mask[0, len(idx):, 0] = True
 
                 if task == "regression":
-                    y_combined = torch.zeros(1, total_len, 1, device=self.device)
-                    y_combined[0, :len(idx), 0] = labels_proc[idx].squeeze(-1)
-                    out = self(X_combined, y_combined, mask, task="regression")[mask].view(-1, 1)
+                    y_combined = torch.zeros(1, total_len, dtype=torch.long, device=self.device)
+                    y_combined[0, :len(idx)] = labels_proc[idx]
+                    
+                    logits = self(X_combined, y_combined, mask, task="regression")[0, len(idx):, :num_bins]
+                    
+                    # Convert logits to probabilities across the bins
+                    probs = F.softmax(logits, dim=-1)
+                    # Expected Value: Sum of (probability * bin_center) for each query
+                    out = (probs * bin_centers).sum(dim=-1).view(-1, 1)
                 else:
                     y_combined = torch.zeros(1, total_len, dtype=torch.long, device=self.device)
                     y_combined[0, :len(idx)] = labels_proc[idx]
@@ -272,8 +346,7 @@ class ChemPFN(pl.LightningModule):
 
             preds_sum[chunk_start:chunk_end] = chunk_preds / passes
 
-        if task == "regression":
-            return preds_sum * y_std + y_mean
+        # No final scalar un-normalization is needed! The expected value is natively on-scale.
         return preds_sum
 
     def configure_optimizers(self):
