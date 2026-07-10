@@ -207,7 +207,7 @@ class ChemPFN(pl.LightningModule):
 
                 preds = self(x_chemeleon, y_binned, query_mask, task="regression")
                 # Now trained using standard CrossEntropy Loss!
-                loss += F.cross_entropy(preds[q], y_binned[q])
+                loss += F.cross_entropy(preds[q], y_binned[q], label_smoothing=0.1)
             loss /= n_accum
             
         else:
@@ -350,4 +350,13 @@ class ChemPFN(pl.LightningModule):
         return preds_sum
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.hparams.lr)
+        optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.hparams.lr)
+        # Smoothly decay the LR down to 1e-6 over the course of training
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.trainer.max_steps, eta_min=1e-6)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            }
+        }

@@ -37,6 +37,11 @@ class ContextWindowCurriculum(Callback):
         # Log it to TensorBoard so you can track the curriculum
         pl_module.log("context_window_max", float(self.collate_fn.current_max_n), sync_dist=True)
 
+        # doesnt belong here, but for convenience, also log the learning rate
+        optimizer = trainer.optimizers[0]
+        current_lr = optimizer.param_groups[0]['lr']
+        pl_module.log("learning_rate", float(current_lr), sync_dist=True)
+
 
 class DelayedEarlyStopping(EarlyStopping):
     def __init__(self, start_tracking_epoch, *args, **kwargs):
@@ -150,6 +155,7 @@ def run_training(smiles_list, max_epochs=512, training_task="regression", init_f
         devices="auto",
         strategy=DDPStrategy(find_unused_parameters=True),
         logger=logger,
+        gradient_clip_val=1.0,  # stabilize training
         callbacks=[
             early_stop_callback, 
             model_checkpoint_callback, 
@@ -157,7 +163,7 @@ def run_training(smiles_list, max_epochs=512, training_task="regression", init_f
         ],
         default_root_dir=logger.log_dir,
         # use bfloat16 precision for faster training and lower memory usage
-        precision="bf16",
+        precision="bf16-mixed",
     )
 
     trainer.fit(model, dataloader)
