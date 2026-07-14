@@ -50,7 +50,6 @@ def _random_mlp_hyperdescriptor(y_subset, H, device):
 
     out = (out - out.mean(dim=1, keepdim=True)) / (out.std(dim=1, keepdim=True) + 1e-6)
     
-    # Inject SAFE noise to simulate experimental error (still crucial for discretization!)
     if torch.rand(1).item() > 0.3:
         base_noise = torch.randn_like(out) * 0.1
         outlier_mask = (torch.rand_like(out) > 0.95).float()
@@ -58,21 +57,46 @@ def _random_mlp_hyperdescriptor(y_subset, H, device):
         out = out + base_noise + outlier_noise
         out = (out - out.mean(dim=1, keepdim=True)) / (out.std(dim=1, keepdim=True) + 1e-6)
 
-    # --- SHAPE AUGMENTATION FOR DISCRETIZER ---
     dist_choice = torch.rand(1).item()
 
     if dist_choice < 0.30:
-        # Log-Normal (Skewed Right): Teaches the model to predict skewed probability curves 
-        # massed in the lower bins with a long tail (e.g., raw clearance, IC50)
         out = torch.exp(out * 1.5)
-        
     elif dist_choice < 0.50:
-        # Sigmoidal (Bimodal/Bounded): Teaches the model to predict probability mass 
-        # at the extreme edge bins (e.g., percentages like RPPB/HPPB or cliff-edges)
         out = torch.sigmoid(out * 2.0)
         
-    # The remaining 50% stays as Standard Normal (Gaussian)
     return out
+
+
+# --- LORA IMPLEMENTATION ---
+class LoRALinear(nn.Module):
+    def __init__(self, linear: nn.Linear, r: int = 8, alpha: float = 16.0, dropout: float = 0.05):
+        super().__init__()
+        self.linear = linear
+        self.r = r
+        self.scaling = alpha / r
+        
+        if r > 0:
+            self.lora_A = nn.Parameter(torch.zeros((linear.in_features, r)))
+            self.lora_B = nn.Parameter(torch.zeros((r, linear.out_features)))
+            self.dropout = nn.Dropout(p=dropout)
+            
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B)
+
+    def forward(self, x):
+        result = self.linear(x)
+        if self.r > 0:
+            result = result + self.dropout(x) @ self.lora_A @ self.lora_B * self.scaling
+        return result
+
+def inject_lora(module, r=8, alpha=16.0, dropout=0.05):
+    """Recursively replaces nn.Linear with LoRALinear to enable parameter-efficient fine-tuning."""
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            setattr(module, name, LoRALinear(child, r=r, alpha=alpha, dropout=dropout))
+        else:
+            inject_lora(child, r=r, alpha=alpha, dropout=dropout)
+# ---------------------------
 
 
 class ChemPFN(pl.LightningModule):
@@ -81,7 +105,6 @@ class ChemPFN(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        # Initialize and freeze the CheMeleon foundation model
         ckpt_dir = Path().home() / ".chemprop"
         ckpt_dir.mkdir(exist_ok=True)
         mp_path = ckpt_dir / "chemeleon_mp.pt"
@@ -97,25 +120,24 @@ class ChemPFN(pl.LightningModule):
 
         assert d_model > 256, "d_model must be greater than 256 to accommodate projection head and regression/classification head"
 
+        # Freeze the base foundation model
         for param in self.chemeleon_encoder.parameters():
             param.requires_grad = False
+            
+        # Inject LoRA into the message passing encoder (automatically sets requires_grad=True on adapters)
+        inject_lora(self.chemeleon_encoder, r=16, alpha=32.0, dropout=0.05)
 
-        # Projection head to reduce to d_model - d_task
         self.x_proj = nn.Linear(self.chemeleon_encoder.output_dim, d_model - d_task)
 
-        # Regression is now Discretized: Embedding + Multi-Class Head
         self.y_embed_reg = nn.Embedding(num_bins, d_task)
         self.head_reg = nn.Linear(d_model, num_bins)
 
-        # Classification: class embedding
         self.y_embed_cls = nn.Embedding(max_classes, d_task)
         self.head_cls = nn.Linear(d_model, max_classes)
 
-        # Use nn.Embedding so it registers as a distinct module in the PyTorch Lightning summary
         self.query_mask_token = nn.Embedding(1, d_task)
         nn.init.normal_(self.query_mask_token.weight, mean=0.0, std=0.02)
 
-        # Transformer expects exactly d_model
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 4,
             batch_first=True, norm_first=True, activation="gelu",
@@ -124,9 +146,7 @@ class ChemPFN(pl.LightningModule):
 
     def forward(self, x, y, query_mask, task="regression"):
         if not isinstance(x, torch.Tensor):
-            with torch.no_grad():
-                self.chemeleon_encoder.eval()
-                x_chemeleon = self.chemeleon_agg(self.chemeleon_encoder(x), x.batch)
+            x_chemeleon = self.chemeleon_agg(self.chemeleon_encoder(x), x.batch)
             x_chemeleon = x_chemeleon.view(1, -1, self.chemeleon_encoder.output_dim)
         else:
             x_chemeleon = x
@@ -134,7 +154,6 @@ class ChemPFN(pl.LightningModule):
         x_tok = self.x_proj(x_chemeleon)
 
         if task == "regression":
-            # Map binned target indices to embeddings
             y_tok = self.y_embed_reg(y.clamp(min=0, max=self.hparams.num_bins - 1))
         else:
             y_tok = self.y_embed_cls(y.clamp(min=0))
@@ -155,21 +174,18 @@ class ChemPFN(pl.LightningModule):
         graph = batch[0]
         graph = _move_graph_to(graph, self.device)
 
-        with torch.no_grad():
-            self.chemeleon_encoder.eval()
-            x_chemeleon = self.chemeleon_agg(self.chemeleon_encoder(graph), graph.batch)
+        # Removed torch.no_grad() and eval() so gradients flow into our new LoRA adapters
+        x_chemeleon = self.chemeleon_agg(self.chemeleon_encoder(graph), graph.batch)
         x_chemeleon = x_chemeleon.view(1, -1, self.chemeleon_encoder.output_dim)
 
         B, N, D = 1, x_chemeleon.shape[1], x_chemeleon.shape[2]
         
-        # Dynamic Masking Ratio (10% to 90%)
         mask_prob = torch.rand(1, device=self.device).item() * 0.8 + 0.1
         query_mask = torch.rand(B, N, 1, device=self.device) > mask_prob
 
         n_accum = 10
         H = 32
         
-        # --- 1. FEATURE SUB-SAMPLING ---
         if torch.rand(1).item() < 0.25:
             K = torch.randint(1, 4, (1,)).item()
         else:
@@ -187,26 +203,22 @@ class ChemPFN(pl.LightningModule):
                 y_hyper = _random_mlp_hyperdescriptor(y_subset, H, self.device)
                 q = query_mask.squeeze(-1)
                 
-                # Dynamic Binning: Calculate range exclusively from the context window
                 context_vals = y_hyper[~q]
                 if context_vals.numel() > 1:
                     y_min, y_max = context_vals.min(), context_vals.max()
                 else:
                     y_min, y_max = y_hyper.min(), y_hyper.max()
 
-                # Pad slightly to ensure boundary values fall safely within bins
                 padding = (y_max - y_min) * 0.05 + 1e-6
                 y_min -= padding
                 y_max += padding
 
                 bin_edges = torch.linspace(y_min.item(), y_max.item(), num_bins + 1, device=self.device)
                 
-                # Convert continuous targets to discrete bin classes (0 to num_bins - 1)
                 y_binned = torch.bucketize(y_hyper.squeeze(-1), bin_edges) - 1
                 y_binned = torch.clamp(y_binned, 0, num_bins - 1)
 
                 preds = self(x_chemeleon, y_binned, query_mask, task="regression")
-                # Now trained using standard CrossEntropy Loss!
                 loss += F.cross_entropy(preds[q], y_binned[q], label_smoothing=0.1)
             loss /= n_accum
             
@@ -217,7 +229,6 @@ class ChemPFN(pl.LightningModule):
                 q = query_mask.squeeze(-1)
                 context_vals = y_hyper[~q, 0]
                 
-                # --- 2. BREAKING THE 50/50 CLASS BALANCE ---
                 percentile = torch.empty(1, device=self.device).uniform_(0.1, 0.9).item()
                 if context_vals.numel() > 1:
                     threshold = torch.quantile(context_vals.float(), percentile)
@@ -226,7 +237,6 @@ class ChemPFN(pl.LightningModule):
                     
                 y_cls = (y_hyper[:, :, 0] >= threshold).long()
                 
-                # --- 3. INJECT ASYMMETRIC ASSAY NOISE ---
                 flip_mask = torch.rand_like(y_cls.float()) < 0.03
                 y_cls = torch.where(flip_mask, 1 - y_cls, y_cls)
 
@@ -245,7 +255,6 @@ class ChemPFN(pl.LightningModule):
             num_bins = self.hparams.num_bins
             labels_raw = torch.tensor(train_labels, dtype=torch.float32, device=self.device)
             
-            # Dynamic binning based on the specific dataset's scale
             y_min, y_max = labels_raw.min(), labels_raw.max()
             padding = (y_max - y_min) * 0.05 + 1e-6
             y_min -= padding
@@ -254,7 +263,6 @@ class ChemPFN(pl.LightningModule):
             bin_edges = torch.linspace(y_min.item(), y_max.item(), num_bins + 1, device=self.device)
             bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
             
-            # Map dataset targets to bin indices for context
             labels_binned = torch.bucketize(labels_raw, bin_edges) - 1
             labels_proc = torch.clamp(labels_binned, 0, num_bins - 1)
         else:
@@ -287,46 +295,36 @@ class ChemPFN(pl.LightningModule):
             passes = n_ensemble if n_train > ctx_n else 1
             chunk_preds = torch.zeros(chunk_size, out_dim, device=self.device)
 
-            # Pre-compute relevance for the entire chunk BEFORE the ensemble loop
             if n_train > ctx_n:
-                train_flat = train_x.squeeze(0)  # [n_train, D]
-                chunk_flat = X_chunk.squeeze(0)  # [chunk_size, D]
+                train_flat = train_x.squeeze(0)
+                chunk_flat = X_chunk.squeeze(0)
                 
-                # Normalize for Cosine Similarity
                 train_norm = F.normalize(train_flat, p=2, dim=-1)
                 chunk_norm = F.normalize(chunk_flat, p=2, dim=-1)
                 
-                # Pairwise similarity matrix: [n_train, chunk_size]
                 sim_matrix = torch.matmul(train_norm, chunk_norm.transpose(0, 1))
-                
-                # Max similarity to ANY molecule in the test chunk
-                relevance, _ = sim_matrix.max(dim=1)  # [n_train]
+                relevance, _ = sim_matrix.max(dim=1)
 
             for _ in range(passes):
                 if n_train > ctx_n:
-                    # Allocate 50% of the context budget to nearest neighbors, 50% to global random sample
+                    # Hybrid Context Retrieval: 50% Nearest-Neighbor, 50% Random
                     top_k_n = ctx_n // 2
                     rand_n = ctx_n - top_k_n
 
                     if passes == 1:
-                        # Deterministic retrieval for single-pass speed
                         _, top_idx = torch.topk(relevance, top_k_n)
                     else:
-                        # Gumbel-Top-K for Stochastic Ensemble Diversity
                         temperature = 0.05
                         u = torch.rand_like(relevance) + 1e-10
                         gumbel_noise = -torch.log(-torch.log(u))
                         noisy_relevance = (relevance / temperature) + gumbel_noise
                         _, top_idx = torch.topk(noisy_relevance, top_k_n)
 
-                    # Retrieve the remaining context randomly from the rest of the dataset
                     available_mask = torch.ones(n_train, dtype=torch.bool, device=self.device)
-                    available_mask[top_idx] = False  # Prevent selecting the exact same neighbors
+                    available_mask[top_idx] = False
                     available_idx = torch.nonzero(available_mask).squeeze(-1)
                     
                     rand_idx = available_idx[torch.randperm(len(available_idx), device=self.device)[:rand_n]]
-
-                    # Combine local and global context
                     idx = torch.cat([top_idx, rand_idx])
                 else:
                     idx = torch.arange(n_train, device=self.device)
@@ -341,10 +339,7 @@ class ChemPFN(pl.LightningModule):
                     y_combined[0, :len(idx)] = labels_proc[idx]
                     
                     logits = self(X_combined, y_combined, mask, task="regression")[0, len(idx):, :num_bins]
-                    
-                    # Convert logits to probabilities across the bins
                     probs = F.softmax(logits, dim=-1)
-                    # Expected Value: Sum of (probability * bin_center) for each query
                     out = (probs * bin_centers).sum(dim=-1).view(-1, 1)
                 else:
                     y_combined = torch.zeros(1, total_len, dtype=torch.long, device=self.device)
@@ -356,11 +351,22 @@ class ChemPFN(pl.LightningModule):
 
             preds_sum[chunk_start:chunk_end] = chunk_preds / passes
 
-        # No final scalar un-normalization is needed! The expected value is natively on-scale.
         return preds_sum
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.hparams.lr)
+        total_steps = self.trainer.estimated_stepping_batches
+        
+        # Smooth cosine decay is critical to let LoRA adapters fine-tune properly alongside the transformer
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=total_steps, 
+            eta_min=1e-6
+        )
         return {
             "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            }
         }
