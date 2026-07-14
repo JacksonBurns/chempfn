@@ -304,20 +304,30 @@ class ChemPFN(pl.LightningModule):
 
             for _ in range(passes):
                 if n_train > ctx_n:
+                    # Allocate 50% of the context budget to nearest neighbors, 50% to global random sample
+                    top_k_n = ctx_n // 2
+                    rand_n = ctx_n - top_k_n
+
                     if passes == 1:
                         # Deterministic retrieval for single-pass speed
-                        _, idx = torch.topk(relevance, ctx_n)
+                        _, top_idx = torch.topk(relevance, top_k_n)
                     else:
                         # Gumbel-Top-K for Stochastic Ensemble Diversity
-                        # Temperature controls randomness (lower = closer to strict top-K)
                         temperature = 0.05
-                        # Generate Gumbel noise
                         u = torch.rand_like(relevance) + 1e-10
                         gumbel_noise = -torch.log(-torch.log(u))
-                        
-                        # Add noise to scaled relevance and extract
                         noisy_relevance = (relevance / temperature) + gumbel_noise
-                        _, idx = torch.topk(noisy_relevance, ctx_n)
+                        _, top_idx = torch.topk(noisy_relevance, top_k_n)
+
+                    # Retrieve the remaining context randomly from the rest of the dataset
+                    available_mask = torch.ones(n_train, dtype=torch.bool, device=self.device)
+                    available_mask[top_idx] = False  # Prevent selecting the exact same neighbors
+                    available_idx = torch.nonzero(available_mask).squeeze(-1)
+                    
+                    rand_idx = available_idx[torch.randperm(len(available_idx), device=self.device)[:rand_n]]
+
+                    # Combine local and global context
+                    idx = torch.cat([top_idx, rand_idx])
                 else:
                     idx = torch.arange(n_train, device=self.device)
 
