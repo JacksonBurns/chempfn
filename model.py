@@ -27,23 +27,32 @@ def _random_mlp_hyperdescriptor(y_subset, H, device):
     B, N, K = y_subset.shape
     depth = torch.randint(0, 3, (1,)).item()
 
+    # Randomly select an activation function for this specific synthetic task
+    act_choice = torch.rand(1).item()
+    if act_choice < 0.33:
+        act_fn = torch.relu
+    elif act_choice < 0.66:
+        act_fn = torch.tanh  # Smooth, bounded non-linearities
+    else:
+        act_fn = torch.sin   # Oscillatory / periodic feature interaction
+
     if depth == 0:
         W = torch.randn(B, K, 1, device=device) / math.sqrt(K)
         out = torch.bmm(y_subset, W)
     elif depth == 1:
         W1 = torch.randn(B, K, H, device=device) / math.sqrt(K)
         b1 = torch.randn(B, 1, H, device=device) * 0.1
-        h = torch.relu(torch.bmm(y_subset, W1) + b1)
+        h = act_fn(torch.bmm(y_subset, W1) + b1)
         W2 = torch.randn(B, H, 1, device=device) / math.sqrt(H)
         b2 = torch.randn(B, 1, 1, device=device) * 0.1
         out = torch.bmm(h, W2) + b2
     else:
         W1 = torch.randn(B, K, H, device=device) / math.sqrt(K)
         b1 = torch.randn(B, 1, H, device=device) * 0.1
-        h = torch.relu(torch.bmm(y_subset, W1) + b1)
+        h = act_fn(torch.bmm(y_subset, W1) + b1)
         W2 = torch.randn(B, H, H, device=device) / math.sqrt(H)
         b2 = torch.randn(B, 1, H, device=device) * 0.1
-        h = torch.relu(torch.bmm(h, W2) + b2)
+        h = act_fn(torch.bmm(h, W2) + b2)
         W3 = torch.randn(B, H, 1, device=device) / math.sqrt(H)
         b3 = torch.randn(B, 1, 1, device=device) * 0.1
         out = torch.bmm(h, W3) + b3
@@ -219,7 +228,21 @@ class ChemPFN(pl.LightningModule):
                 y_binned = torch.clamp(y_binned, 0, num_bins - 1)
 
                 preds = self(x_chemeleon, y_binned, query_mask, task="regression")
-                loss += F.cross_entropy(preds[q], y_binned[q], label_smoothing=0.1)
+                
+                # --- GAUSSIAN ORDINAL SMOOTHING ---
+                # Create a Gaussian curve centered on the true bin
+                sigma = 2.0  # Controls how "wide" the acceptable error margin is
+                bin_indices = torch.arange(num_bins, device=self.device).float()
+                
+                y_true_float = y_binned[q].float().unsqueeze(-1)
+                
+                # Calculate unnormalized Gaussian probabilities
+                soft_labels = torch.exp(-0.5 * ((bin_indices - y_true_float) / sigma) ** 2)
+                # Normalize so they sum to 1.0
+                soft_labels = soft_labels / soft_labels.sum(dim=-1, keepdim=True)
+
+                # PyTorch F.cross_entropy natively accepts soft probability targets
+                loss += F.cross_entropy(preds[q], soft_labels)
             loss /= n_accum
             
         else:
