@@ -127,7 +127,7 @@ class ChemPFN(pl.LightningModule):
         # Inject LoRA into the message passing encoder (automatically sets requires_grad=True on adapters)
         inject_lora(self.chemeleon_encoder, r=16, alpha=32.0, dropout=0.05)
 
-        self.x_proj = nn.Linear(self.chemeleon_encoder.output_dim, d_model - d_task)
+        self.x_proj = nn.Linear(2_048, d_model - d_task)
 
         self.y_embed_reg = nn.Embedding(num_bins, d_task)
         self.head_reg = nn.Linear(d_model, num_bins)
@@ -147,7 +147,7 @@ class ChemPFN(pl.LightningModule):
     def forward(self, x, y, query_mask, task="regression"):
         if not isinstance(x, torch.Tensor):
             x_chemeleon = self.chemeleon_agg(self.chemeleon_encoder(x), x.batch)
-            x_chemeleon = x_chemeleon.view(1, -1, self.chemeleon_encoder.output_dim)
+            x_chemeleon = x_chemeleon.view(1, -1, 2_048)
         else:
             x_chemeleon = x
 
@@ -176,7 +176,7 @@ class ChemPFN(pl.LightningModule):
 
         # Removed torch.no_grad() and eval() so gradients flow into our new LoRA adapters
         x_chemeleon = self.chemeleon_agg(self.chemeleon_encoder(graph), graph.batch)
-        x_chemeleon = x_chemeleon.view(1, -1, self.chemeleon_encoder.output_dim)
+        x_chemeleon = x_chemeleon.view(1, -1, 2_048)
 
         B, N, D = 1, x_chemeleon.shape[1], x_chemeleon.shape[2]
         
@@ -275,7 +275,7 @@ class ChemPFN(pl.LightningModule):
 
         with torch.no_grad():
             self.chemeleon_encoder.eval()
-            all_chemeleon = self.chemeleon_agg(self.chemeleon_encoder(graph), graph.batch).view(1, -1, self.chemeleon_encoder.output_dim)
+            all_chemeleon = self.chemeleon_agg(self.chemeleon_encoder(graph), graph.batch).view(1, -1, 2_048)
 
         n_train = len(train_labels)
         n_test = len(test_smiles)

@@ -193,11 +193,11 @@ if __name__ == "__main__":
     bl = BlockLogs()
 
     # Phase 1: Regression pre-training from scratch
-    # reg_ckpt = run_training(smiles, max_epochs=512, training_task="regression")
+    reg_ckpt = run_training(smiles, max_epochs=512, training_task="regression")
 
     # Phase 2: Classification pre-training from scratch
     cls_ckpt = run_training(smiles, max_epochs=512, training_task="classification")
 
     print(f"Both phases complete.")
-    # print(f"  Regression checkpoint: {reg_ckpt}")
+    print(f"  Regression checkpoint: {reg_ckpt}")
     print(f"  Classification checkpoint: {cls_ckpt}")
