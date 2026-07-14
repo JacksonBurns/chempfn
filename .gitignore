@@ -3,7 +3,6 @@ logs
 *.smiles
 *.parquet
 *.ckpt
-eval_results.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
