@@ -220,7 +220,7 @@ class ChemPFN(pl.LightningModule):
                 # --- 2. BREAKING THE 50/50 CLASS BALANCE ---
                 percentile = torch.empty(1, device=self.device).uniform_(0.1, 0.9).item()
                 if context_vals.numel() > 1:
-                    threshold = torch.quantile(context_vals, percentile)
+                    threshold = torch.quantile(context_vals.float(), percentile)
                 else:
                     threshold = context_vals.mean()
                     
@@ -351,12 +351,6 @@ class ChemPFN(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.hparams.lr)
-        # Smoothly decay the LR down to 1e-6 over the course of training
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.trainer.max_steps, eta_min=1e-6)
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-            }
         }
