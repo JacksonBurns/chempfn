@@ -101,7 +101,12 @@ class ChemPFN(pl.LightningModule):
         for param in self.chemeleon_encoder.parameters():
             param.requires_grad = False
 
-        self.x_proj = nn.Linear(2_048, d_model - d_task)
+        self.x_proj = nn.Sequential(
+            nn.Linear(2_048, 2_048*2),
+            nn.GELU(),
+            nn.LayerNorm(2_048*2),
+            nn.Linear(2_048*2, d_model - d_task)
+        )
 
         self.y_embed_reg = nn.Embedding(num_bins, d_task)
         self.head_reg = nn.Linear(d_model, num_bins)

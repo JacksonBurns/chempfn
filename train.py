@@ -96,8 +96,8 @@ def run_training(smiles_list, max_epochs=512, training_task="regression", init_f
 
     dataset = SmilesDataset(smiles_list)
 
-    start_max_n = 4096
-    end_max_n = start_max_n + 1  # Grow to your target ceiling
+    start_max_n = 128
+    end_max_n = 4096  # Grow to your target ceiling
     
     # 1. Instantiate the stateful collator
     collate_fn = CurriculumCollate(
