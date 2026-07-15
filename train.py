@@ -95,13 +95,16 @@ def run_training(smiles_list, max_epochs=512, training_task="regression", init_f
     print(f"=== Phase: {training_task} pre-training ===")
 
     dataset = SmilesDataset(smiles_list)
+
+    start_max_n = 4096
+    end_max_n = start_max_n + 1  # Grow to your target ceiling
     
     # 1. Instantiate the stateful collator
     collate_fn = CurriculumCollate(
         smiles_list, 
         min_n=64, 
-        start_max_n=128,  # Start with a smaller ceiling 
-        end_max_n=4096,    # Grow to your target ceiling
+        start_max_n=start_max_n,  # Start with a smaller ceiling 
+        end_max_n=end_max_n,    # Grow to your target ceiling
     )
     
     dataloader = DataLoader(
@@ -143,8 +146,8 @@ def run_training(smiles_list, max_epochs=512, training_task="regression", init_f
     curriculum_callback = ContextWindowCurriculum(
         collate_fn=collate_fn, 
         warmup_epochs=max_epochs // 2, 
-        start_max_n=128, 
-        end_max_n=4096,
+        start_max_n=start_max_n, 
+        end_max_n=end_max_n,
     )
 
     trainer = pl.Trainer(
