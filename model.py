@@ -21,60 +21,95 @@ def _move_graph_to(graph, device):
             setattr(graph, field, v.to(device))
     return graph
 
-
-def _random_mlp_hyperdescriptor(y_subset, H, device):
-    """Create a scalar hyperdescriptor from a subset of descriptors via a random MLP."""
-    B, N, K = y_subset.shape
-    depth = torch.randint(0, 3, (1,)).item()
-
-    # Randomly select an activation function for this specific synthetic task
-    act_choice = torch.rand(1).item()
-    if act_choice < 0.33:
-        act_fn = torch.relu
-    elif act_choice < 0.66:
-        act_fn = torch.tanh  # Smooth, bounded non-linearities
+def _generate_synthetic_targets(y_subset, H, device):
+    # IMMEDIATELY cast to float32 to prevent bfloat16 catastrophic cancellation in std()
+    x_input = y_subset.float()
+    B, N, K = x_input.shape
+    
+    # --- 1. SIMULATE REAL-WORLD ARTIFACTS ---
+    if torch.rand(1).item() < 0.7:
+        dropout_rate = torch.empty(1, device=device).uniform_(0.05, 0.30).item()
+        dropout_mask = (torch.rand_like(x_input) > dropout_rate).float()
+        x_input = x_input * dropout_mask
+        
+    prior_type = torch.rand(1).item()
+    out = torch.zeros(B, N, 1, device=device, dtype=torch.float32)
+    
+    if prior_type < 0.33:
+        # BNN Prior
+        depth = torch.randint(1, 4, (1,)).item()
+        h = x_input
+        for _ in range(depth):
+            weight_var = torch.empty(1, device=device).uniform_(0.1, 2.0).item()
+            W = (torch.randn(B, h.shape[2], H, device=device) * math.sqrt(weight_var)) / math.sqrt(h.shape[2])
+            b = torch.randn(B, 1, H, device=device) * 0.1
+            
+            act_choice = torch.rand(1).item()
+            if act_choice < 0.33: act_fn = torch.relu
+            elif act_choice < 0.66: act_fn = torch.tanh
+            else: act_fn = torch.sin
+            h = act_fn(torch.bmm(h, W) + b)
+            
+        W_out = torch.randn(B, H, 1, device=device) / math.sqrt(H)
+        out = torch.bmm(h, W_out)
+        
+    elif prior_type < 0.66:
+        # Random Forest Prior
+        n_trees = torch.randint(1, 4, (1,)).item()
+        depth = torch.randint(2, 5, (1,)).item()
+        
+        for _ in range(n_trees):
+            tree_out = torch.zeros(B, N, 1, device=device)
+            node_masks = [torch.ones(B, N, 1, dtype=torch.bool, device=device)]
+            
+            for d in range(depth):
+                new_masks = []
+                for mask in node_masks:
+                    split_feat = torch.randint(0, K, (1,)).item()
+                    feature_vals = x_input[:, :, split_feat:split_feat+1]
+                    threshold = torch.randn(1, device=device) 
+                    
+                    left_mask = mask & (feature_vals < threshold)
+                    right_mask = mask & (feature_vals >= threshold)
+                    new_masks.extend([left_mask, right_mask])
+                node_masks = new_masks
+                
+            for mask in node_masks:
+                leaf_val = torch.randn(1, device=device)
+                tree_out = torch.where(mask, leaf_val, tree_out)
+            out += tree_out
+        out /= n_trees
+        
     else:
-        act_fn = torch.sin   # Oscillatory / periodic feature interaction
+        # SCM Prior
+        n_mechanisms = torch.randint(2, 6, (1,)).item()
+        for _ in range(n_mechanisms):
+            n_causes = torch.randint(1, min(4, K + 1), (1,)).item()
+            causes_idx = torch.randperm(K)[:n_causes]
+            causes = x_input[:, :, causes_idx]
+            
+            weights = torch.randn(B, n_causes, 1, device=device)
+            linear_combo = torch.bmm(causes, weights)
+            
+            mech_type = torch.rand(1).item()
+            if mech_type < 0.33: mech_out = torch.sin(linear_combo * torch.randn(1, device=device) * 3)
+            elif mech_type < 0.66: mech_out = torch.exp(-torch.abs(linear_combo))
+            else: mech_out = (linear_combo > torch.randn(1, device=device)).float()
+                
+            out += mech_out * torch.randn(1, device=device)
 
-    if depth == 0:
-        W = torch.randn(B, K, 1, device=device) / math.sqrt(K)
-        out = torch.bmm(y_subset, W)
-    elif depth == 1:
-        W1 = torch.randn(B, K, H, device=device) / math.sqrt(K)
-        b1 = torch.randn(B, 1, H, device=device) * 0.1
-        h = act_fn(torch.bmm(y_subset, W1) + b1)
-        W2 = torch.randn(B, H, 1, device=device) / math.sqrt(H)
-        b2 = torch.randn(B, 1, 1, device=device) * 0.1
-        out = torch.bmm(h, W2) + b2
-    else:
-        W1 = torch.randn(B, K, H, device=device) / math.sqrt(K)
-        b1 = torch.randn(B, 1, H, device=device) * 0.1
-        h = act_fn(torch.bmm(y_subset, W1) + b1)
-        W2 = torch.randn(B, H, H, device=device) / math.sqrt(H)
-        b2 = torch.randn(B, 1, H, device=device) * 0.1
-        h = act_fn(torch.bmm(h, W2) + b2)
-        W3 = torch.randn(B, H, 1, device=device) / math.sqrt(H)
-        b3 = torch.randn(B, 1, 1, device=device) * 0.1
-        out = torch.bmm(h, W3) + b3
-
-    out = (out - out.mean(dim=1, keepdim=True)) / (out.std(dim=1, keepdim=True) + 1e-6)
+    # --- 5. LABEL DEGRADATION ---
+    # Safe float32 normalization
+    out = (out - out.mean(dim=1, keepdim=True)) / (out.std(dim=1, keepdim=True) + 1e-5)
     
     if torch.rand(1).item() > 0.3:
-        base_noise = torch.randn_like(out) * 0.1
+        out += torch.randn_like(out) * 0.1
         outlier_mask = (torch.rand_like(out) > 0.95).float()
-        outlier_noise = (torch.rand_like(out) * 6.0 - 3.0) * outlier_mask 
-        out = out + base_noise + outlier_noise
-        out = (out - out.mean(dim=1, keepdim=True)) / (out.std(dim=1, keepdim=True) + 1e-6)
+        out += (torch.rand_like(out) * 6.0 - 3.0) * outlier_mask 
 
-    dist_choice = torch.rand(1).item()
-
-    if dist_choice < 0.30:
-        out = torch.exp(out * 1.5)
-    elif dist_choice < 0.50:
-        out = torch.sigmoid(out * 2.0)
-        
+    # NOTE: exp() and sigmoid() transforms were removed here because they do nothing 
+    # to quantiles but severely risk float truncation.
     return out
-
 
 class ChemPFN(pl.LightningModule):
     def __init__(self, d_model=512, n_heads=4, n_layers=8, lr=1e-4,
@@ -182,52 +217,52 @@ class ChemPFN(pl.LightningModule):
             num_bins = self.hparams.num_bins
             loss = 0.0
             for _ in range(n_accum):
-                y_hyper = _random_mlp_hyperdescriptor(y_subset, H, self.device)
+                y_hyper = _generate_synthetic_targets(y_subset, H, self.device)
                 q = query_mask.squeeze(-1)
                 
-                context_vals = y_hyper[~q]
-                if context_vals.numel() > 1:
-                    y_min, y_max = context_vals.min(), context_vals.max()
-                else:
-                    y_min, y_max = y_hyper.min(), y_hyper.max()
-
-                padding = (y_max - y_min) * 0.05 + 1e-6
-                y_min -= padding
-                y_max += padding
-
-                bin_edges = torch.linspace(y_min.item(), y_max.item(), num_bins + 1, device=self.device)
+                # --- QUANTILE REGRESSION BINNING ---
+                # y_hyper is already float32 now, but ensuring it anyway
+                y_f32 = y_hyper.squeeze(-1).float()
                 
-                y_binned = torch.bucketize(y_hyper.squeeze(-1), bin_edges) - 1
+                # Dynamic tie-breaking noise to prevent exact duplicates from SCM/Trees
+                noise_scale = y_f32.std().item() * 1e-4 + 1e-6
+                y_f32 += torch.randn_like(y_f32) * noise_scale
+                
+                q_probs = torch.linspace(0.0, 1.0, num_bins + 1, device=self.device, dtype=torch.float32)
+                bin_edges = torch.quantile(y_f32, q_probs)
+                
+                # Expand outer edges slightly to catch numerical limits safely
+                bin_edges[0] -= 1e-4
+                bin_edges[-1] += 1e-4
+                
+                y_binned = torch.bucketize(y_f32, bin_edges) - 1
                 y_binned = torch.clamp(y_binned, 0, num_bins - 1)
 
                 preds = self(x_chemeleon, y_binned, query_mask, task="regression")
                 
                 # --- GAUSSIAN ORDINAL SMOOTHING ---
-                # Create a Gaussian curve centered on the true bin
-                sigma = 2.0  # Controls how "wide" the acceptable error margin is
+                sigma = 2.0  
                 bin_indices = torch.arange(num_bins, device=self.device).float()
                 
                 y_true_float = y_binned[q].float().unsqueeze(-1)
-                
-                # Calculate unnormalized Gaussian probabilities
                 soft_labels = torch.exp(-0.5 * ((bin_indices - y_true_float) / sigma) ** 2)
-                # Normalize so they sum to 1.0
                 soft_labels = soft_labels / soft_labels.sum(dim=-1, keepdim=True)
 
-                # PyTorch F.cross_entropy natively accepts soft probability targets
                 loss += F.cross_entropy(preds[q], soft_labels)
             loss /= n_accum
             
         else:
             loss = 0.0
             for _ in range(n_accum):
-                y_hyper = _random_mlp_hyperdescriptor(y_subset, H, self.device)
+                y_hyper = _generate_synthetic_targets(y_subset, H, self.device)
                 q = query_mask.squeeze(-1)
-                context_vals = y_hyper[~q, 0]
+                
+                # Must cast to float32 for torch.quantile
+                context_vals = y_hyper[~q, 0].float()
                 
                 percentile = torch.empty(1, device=self.device).uniform_(0.1, 0.9).item()
                 if context_vals.numel() > 1:
-                    threshold = torch.quantile(context_vals.float(), percentile)
+                    threshold = torch.quantile(context_vals, percentile)
                 else:
                     threshold = context_vals.mean()
                     
@@ -249,14 +284,18 @@ class ChemPFN(pl.LightningModule):
 
         if task == "regression":
             num_bins = self.hparams.num_bins
+            
+            # --- QUANTILE REGRESSION BINNING FOR INFERENCE ---
             labels_raw = torch.tensor(train_labels, dtype=torch.float32, device=self.device)
             
-            y_min, y_max = labels_raw.min(), labels_raw.max()
-            padding = (y_max - y_min) * 0.05 + 1e-6
-            y_min -= padding
-            y_max += padding
-
-            bin_edges = torch.linspace(y_min.item(), y_max.item(), num_bins + 1, device=self.device)
+            # Add tiny tie-breaking noise to guarantee monotonic bin edges
+            labels_f32 = labels_raw + torch.randn_like(labels_raw) * 1e-6 
+            
+            q_probs = torch.linspace(0.0, 1.0, num_bins + 1, device=self.device, dtype=torch.float32)
+            bin_edges = torch.quantile(labels_f32, q_probs)
+            
+            bin_edges[0] -= 1e-4
+            bin_edges[-1] += 1e-4
             bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
             
             labels_binned = torch.bucketize(labels_raw, bin_edges) - 1
@@ -303,7 +342,6 @@ class ChemPFN(pl.LightningModule):
 
             for _ in range(passes):
                 if n_train > ctx_n:
-                    # Hybrid Context Retrieval: 50% Nearest-Neighbor, 50% Random
                     top_k_n = ctx_n // 2
                     rand_n = ctx_n - top_k_n
 
@@ -353,11 +391,16 @@ class ChemPFN(pl.LightningModule):
         optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.hparams.lr)
         total_steps = self.trainer.estimated_stepping_batches
         
-        # Smooth cosine decay is critical to let LoRA adapters fine-tune properly alongside the transformer
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, 
-            T_max=total_steps, 
-            eta_min=1e-6
+        # OneCycleLR provides the critical learning rate warmup transformers need,
+        # followed by the smooth cosine decay.
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.hparams.lr,
+            total_steps=total_steps,
+            pct_start=0.1,  # 10% of training spent warming up
+            anneal_strategy='cos',
+            div_factor=10.0,
+            final_div_factor=100.0
         )
         return {
             "optimizer": optimizer,
