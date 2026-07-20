@@ -91,18 +91,18 @@ class CurriculumCollate:
         return (graph,)
 
 
-def run_training(smiles_list, max_epochs=512, training_task="regression", init_from=None):
+def run_training(smiles_list, max_epochs=2_048, training_task="regression", init_from=None):
     print(f"=== Phase: {training_task} pre-training ===")
 
     dataset = SmilesDataset(smiles_list)
 
-    start_max_n = 128
+    start_max_n = 256
     end_max_n = 4096  # Grow to your target ceiling
     
     # 1. Instantiate the stateful collator
     collate_fn = CurriculumCollate(
         smiles_list, 
-        min_n=64, 
+        min_n=128, 
         start_max_n=start_max_n,  # Start with a smaller ceiling 
         end_max_n=end_max_n,    # Grow to your target ceiling
     )
@@ -129,7 +129,7 @@ def run_training(smiles_list, max_epochs=512, training_task="regression", init_f
     early_stop_callback = DelayedEarlyStopping(
         start_tracking_epoch=256,
         monitor="train_loss_epoch",
-        patience=32,
+        patience=128,
         mode="min",
         check_on_train_epoch_end=True,
     )
@@ -142,10 +142,10 @@ def run_training(smiles_list, max_epochs=512, training_task="regression", init_f
         save_on_train_epoch_end=True,
     )
     
-    # 3. Instantiate the callback (e.g., stretching the curriculum over half the total epochs)
+    # 3. Instantiate the callback
     curriculum_callback = ContextWindowCurriculum(
         collate_fn=collate_fn, 
-        warmup_epochs=max_epochs // 2, 
+        warmup_epochs=256, 
         start_max_n=start_max_n, 
         end_max_n=end_max_n,
     )
@@ -196,10 +196,10 @@ if __name__ == "__main__":
     bl = BlockLogs()
 
     # Phase 1: Regression pre-training from scratch
-    reg_ckpt = run_training(smiles, max_epochs=512, training_task="regression")
+    reg_ckpt = run_training(smiles, training_task="regression")
 
     # Phase 2: Classification pre-training from scratch
-    cls_ckpt = run_training(smiles, max_epochs=512, training_task="classification")
+    cls_ckpt = run_training(smiles, training_task="classification")
 
     print(f"Both phases complete.")
     print(f"  Regression checkpoint: {reg_ckpt}")

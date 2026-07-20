@@ -112,7 +112,7 @@ def _generate_synthetic_targets(y_subset, H, device):
     return out
 
 class ChemPFN(pl.LightningModule):
-    def __init__(self, d_model=512, n_heads=4, n_layers=8, lr=1e-4,
+    def __init__(self, d_model=512, n_heads=4, n_layers=8, lr=5e-5,
                  max_classes=4, training_task="regression", d_task=32, num_bins=100):
         super().__init__()
         self.save_hyperparameters()
@@ -397,7 +397,7 @@ class ChemPFN(pl.LightningModule):
             optimizer,
             max_lr=self.hparams.lr,
             total_steps=total_steps,
-            pct_start=0.1,  # 10% of training spent warming up
+            pct_start=256/2048,  # warmup while curriculum is still in effect
             anneal_strategy='cos',
             div_factor=10.0,
             final_div_factor=100.0
