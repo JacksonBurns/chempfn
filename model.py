@@ -136,6 +136,8 @@ class ChemPFN(pl.LightningModule):
         for param in self.chemeleon_encoder.parameters():
             param.requires_grad = False
 
+        self.chemeleon_layernorm = nn.LayerNorm(2_048)
+
         self.x_proj = nn.Sequential(
             nn.Linear(2_048, 2_048*2),
             nn.GELU(),
@@ -162,7 +164,9 @@ class ChemPFN(pl.LightningModule):
         if not isinstance(x, torch.Tensor):
             with torch.no_grad():
                 self.chemeleon_encoder.eval()
+                self.chemeleon_layernorm.eval()
                 x_chemeleon = self.chemeleon_agg(self.chemeleon_encoder(x), x.batch)
+                x_chemeleon = self.chemeleon_layernorm(x_chemeleon)
         else:
             x_chemeleon = x
 
@@ -192,7 +196,8 @@ class ChemPFN(pl.LightningModule):
         with torch.no_grad():
             self.chemeleon_encoder.eval()
             x_chemeleon = self.chemeleon_agg(self.chemeleon_encoder(graph), graph.batch)
-
+        # outside of no_grad() to allow gradients to flow through batchnorm
+        x_chemeleon = self.chemeleon_layernorm(x_chemeleon)
         x_chemeleon = x_chemeleon.view(1, -1, 2_048)
 
         B, N, D = 1, x_chemeleon.shape[1], x_chemeleon.shape[2]
@@ -200,7 +205,7 @@ class ChemPFN(pl.LightningModule):
         mask_prob = torch.rand(1, device=self.device).item() * 0.8 + 0.1
         query_mask = torch.rand(B, N, 1, device=self.device) > mask_prob
 
-        n_accum = 10
+        n_accum = 16
         H = 32
         
         if torch.rand(1).item() < 0.25:
@@ -310,7 +315,9 @@ class ChemPFN(pl.LightningModule):
 
         with torch.no_grad():
             self.chemeleon_encoder.eval()
+            self.chemeleon_layernorm.eval()
             all_chemeleon = self.chemeleon_agg(self.chemeleon_encoder(graph), graph.batch).view(1, -1, 2_048)
+            all_chemeleon = self.chemeleon_layernorm(all_chemeleon)
 
         n_train = len(train_labels)
         n_test = len(test_smiles)
